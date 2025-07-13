@@ -61,9 +61,15 @@
 
 # --- Standard Library Imports ---
 import os
-
-# --- Third-Party Library Imports ---
+import re
 import pandas as pd
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+import time
+
 import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
@@ -117,27 +123,100 @@ opt.solvers.options['show_progress'] = False
 # ==============================================================================
 print("--- Section 2: Loading ETF Data and Calculating Returns ---")
 
-# --- 2a. Load ETF Metadata ---
-# We attempt to load ETF metadata from a local Excel file.
-# This file provides full fund names and expense ratios for our list of ETFs.
-# If the file is not found, we fall back to a predefined list of symbols.
-try:
-    etf_lookup_df = pd.read_excel("vanguard_etf_list.xlsx", skiprows=4)
-    etf_name_map = dict(zip(etf_lookup_df['Symbol'], etf_lookup_df['Fund name']))
-    etf_expense_map = dict(zip(etf_lookup_df['Symbol'], etf_lookup_df['Expense ratio']))
-    # Clean the dictionaries by removing any entries where the symbol is NaN (Not a Number).
-    etf_name_map = {k: v for k, v in etf_name_map.items() if pd.notna(k)}
-    etf_expense_map = {k: v for k, v in etf_expense_map.items() if pd.notna(k)}
-    etf_symbols = list(etf_name_map.keys())
-    print(f"Successfully loaded metadata for {len(etf_symbols)} ETFs.")
-except FileNotFoundError:
-    print("Warning: 'vanguard_etf_list.xlsx' not found.")
-    print("Using a smaller, predefined list of ETFs as a fallback.")
-    etf_symbols = ['VOO', 'VTI', 'VEA', 'VWO', 'BND', 'BNDX', 'VGIT', 'VGLT', 'VTIP', 'MUB']
-    # Use placeholder names and a generic expense ratio if the file is missing.
-    etf_name_map = {s: s for s in etf_symbols}
-    etf_expense_map = {s: 0.0003 for s in etf_symbols} # 0.03%
+# --- 2a. Load ETF Metadata Directly from Vanguard Website ---
+# Vanguard’s advisor site displays all available ETFs, including their tickers, names, and expense ratios.
+# Since the data is rendered with JavaScript, we use Selenium to simulate a browser and extract the table contents.
+# The site uses pagination to split the full list into two pages (~97 funds total), which we handle below.
 
+# --- Setup Selenium Chrome driver in headless mode (no visible browser window) ---
+options = Options()
+options.add_argument("--headless=new")       # Use latest headless mode
+options.add_argument("--disable-gpu")        # Optional: improves headless stability
+
+# Point to local chromedriver binary (must match your installed Chrome version)
+service = Service(executable_path="./chromedriver")
+driver = webdriver.Chrome(service=service, options=options)
+
+# --- Helper function to extract ETF data from the current table view ---
+def extract_table_data():
+    """Extract ETF data from the current table view as a list of dictionaries."""
+    table = driver.find_element(By.CSS_SELECTOR, "table tbody")     # Locate table body
+    rows = table.find_elements(By.TAG_NAME, "tr")                   # Each row is one ETF
+    data = []
+
+    for row in rows:
+        try:
+            # Extract ticker symbol (1st column)
+            symbol = row.find_elements(By.TAG_NAME, "td")[0].text.strip()
+
+            # Extract and clean fund name (from embedded <div> tag)
+            raw_name = row.find_elements(By.TAG_NAME, "div")[1].text.strip()
+            fund_name = re.sub(r"\s*(NEW FUND)?\s*$", "", raw_name.replace("\n", " ")).strip()
+
+            # Extract and convert expense ratio (8th column), handle missing or malformed data
+            expense_ratio = row.find_elements(By.TAG_NAME, "td")[7].text.strip().replace('%', '').strip()
+            try:
+                expense_ratio = float(expense_ratio) / 100
+            except ValueError:
+                expense_ratio = None
+
+            data.append({
+                "Symbol": symbol,
+                "Fund name": fund_name,
+                "Expense ratio": expense_ratio
+            })
+
+        except Exception:
+            # Skip row if parsing fails (e.g. structure is malformed)
+            continue
+
+    return data
+
+# --- Scrape data across paginated ETF table ---
+try:
+    # Step 1: Load Vanguard ETF page and allow full render
+    driver.get("https://advisors.vanguard.com/investments/etfs")
+    time.sleep(6)
+
+    # Step 2: Extract ETF data from first page (first 50 ETFs)
+    extracted_data = extract_table_data()
+
+    # Step 3: Click "Next page" button to reveal remaining ETFs
+    try:
+        next_button = driver.find_element(By.XPATH, '//button[@aria-label[contains(., "Forward one page")]]')
+        next_button.click()
+        time.sleep(5)  # Wait for second page to load
+
+        # Step 4: Extract ETF data from second page (remaining ~47 ETFs)
+        extracted_data += extract_table_data()
+
+    except Exception as e:
+        print("Pagination failed or second page not available.")
+        print(f"Reason: {e}")
+
+    # Step 5: Load ETF metadata into DataFrame and create lookup dictionaries
+    df = pd.DataFrame(extracted_data)
+    etf_name_map = dict(zip(df['Symbol'], df['Fund name']))
+    etf_expense_map = dict(zip(df['Symbol'], df['Expense ratio']))
+    etf_symbols = list(etf_name_map.keys())
+
+    print(f"Successfully extracted {len(etf_symbols)} ETFs across pages.")
+    print(df.head())
+
+# --- Handle errors by falling back to a static list of core ETFs ---
+except Exception as e:
+    print("Could not complete ETF extraction.")
+    print(f"Reason: {e}")
+
+    etf_symbols = ['VOO', 'VTI', 'VEA', 'VWO', 'BND', 'BNDX', 'VGIT', 'VGLT', 'VTIP', 'MUB']
+    etf_name_map = {s: s for s in etf_symbols}
+    etf_expense_map = {s: 0.0003 for s in etf_symbols}  # Fallback default expense ratio
+
+# --- Always close the Selenium browser session, even on failure ---
+finally:
+    driver.quit()
+
+    
 # --- 2b. Filter the ETF Universe ---
 # To create a diversified portfolio of broad asset classes, we remove specialized
 # sector-specific ETFs and redundant funds.
