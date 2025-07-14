@@ -4,5 +4,6 @@
 # Except these files
 !Optimal_portfolio_analysis.py
 !Optimal_Portfolio_Analysis.ipynb
+!OOS_testing.py
 !.gitignore
 
