@@ -34,7 +34,7 @@
 #           portfolio that is less sensitive to estimation errors.
 #       -   Implements a "Rolling Window" analysis to see how the optimal
 #           portfolio weights would have changed over time.
-#       -   Implement "Black-Litterman and Hierarchical Risk Parity (HRP)"
+#       -   Implement Black-Litterman, Risk Parity, and Hierarchical Risk Parity (HRP) Optimization
 #           analysis additional advanced methods.
 #
 #   5.  REGIME-SWITCHING MODEL:
@@ -78,6 +78,7 @@ import statsmodels.api as sm
 
 from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
 from scipy.spatial.distance import squareform
+from scipy.optimize import minimize
 import cvxpy as cp
 
 from sklearn.covariance import LedoitWolf
@@ -672,45 +673,133 @@ for i, wt in enumerate(w_bl_opt):
     if wt > 0.01:
         print(f"  - {etf_symbols[i]}: {wt:.1%}")
 
+# --- 4e. Risk Parity (HRP) ---
+print("\n--- Risk Parity Portfolio Optimization ---")
 
-# --- 4e. Hierarchical Risk Parity (HRP) ---
-print("\n--- Section Y: Hierarchical Risk Parity Portfolio Optimization ---")
 
+# --- Define functions for risk and risk contributions ---
+
+# Portfolio standard deviation
+def portfolio_vol(weights, cov):
+    return np.sqrt(weights.T @ cov @ weights)
+
+# Marginal contribution to risk
+def marginal_risk_contribution(weights, cov):
+    port_vol = portfolio_vol(weights, cov)
+    return (cov @ weights) / port_vol
+
+# Total contribution to risk per asset
+def risk_contributions(weights, cov):
+    port_vol = portfolio_vol(weights, cov)
+    mrc = marginal_risk_contribution(weights, cov)
+    return weights * mrc / port_vol
+
+# Objective: minimize squared differences in risk contributions
+def risk_parity_objective(weights, cov):
+    rc = risk_contributions(weights, cov)
+    avg_rc = np.mean(rc)
+    return np.sum((rc - avg_rc) ** 2)
+
+# ---  Solve optimization problem ---
+
+n = annual_cov_sample.shape[0]
+x0 = np.ones(n) / n  # initial weights (equal weight)
+bounds = [(0.0, 1.0) for _ in range(n)]  # long-only
+constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+
+result = minimize(
+    fun=risk_parity_objective,
+    x0=x0,
+    args=(annual_cov_sample,),
+    method='SLSQP',
+    bounds=bounds,
+    constraints=constraints,
+    options={'disp': False}
+)
+
+rp_weights = result.x
+
+# --- Display results ---
+print("Optimal Risk Parity Portfolio Weights:")
+for i, wt in enumerate(rp_weights):
+    if wt > 0.01:
+        print(f"  - {etf_symbols[i]}: {wt:.1%}")
+
+
+# --- 4f. Hierarchical Risk Parity (HRP) ---
+print("\n--- Hierarchical Risk Parity Portfolio Optimization ---")
+
+# --- Helper: Correlation to distance ---
 def correl_dist(corr):
     return np.sqrt(0.5 * (1 - corr))
 
-def get_quasi_diag(link):
-    sort_ix = leaves_list(link)
-    return sort_ix
+# --- Helper: Get cluster variance ---
+def get_cluster_var(cov, cluster_indices):
+    sub_cov = cov[np.ix_(cluster_indices, cluster_indices)]
+    inv_var_weights = 1.0 / np.diag(sub_cov)
+    inv_var_weights /= inv_var_weights.sum()
+    cluster_var = inv_var_weights @ sub_cov @ inv_var_weights
+    return cluster_var
 
-# Step 1: Compute correlation and distance matrix
+# --- Recursive bisection for HRP weights ---
+def recursive_bisect(cov, sort_ix):
+    weights = pd.Series(1.0, index=sort_ix)
+    clusters = [sort_ix]
+
+    while clusters:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+        split = int(len(cluster) / 2)
+        left = cluster[:split]
+        right = cluster[split:]
+
+        var_left = get_cluster_var(cov, left)
+        var_right = get_cluster_var(cov, right)
+        alpha = 1.0 - var_left / (var_left + var_right)
+
+        weights[left] *= alpha
+        weights[right] *= (1.0 - alpha)
+        clusters += [left, right]
+
+    return weights.sort_index()
+
+# --- Step 1: Correlation, distance, linkage ---
 corr = returns_monthly.corr()
 dist = correl_dist(corr)
 link = linkage(squareform(dist), method='single')
 
-# Step 2: Quasi-diagonalization (ordering)
-sort_ix = get_quasi_diag(link)
+# --- Step 2: Seriation (quasi-diagonalization) ---
+sort_ix = leaves_list(link)
 sorted_tickers = [etf_symbols[i] for i in sort_ix]
 
-# Step 3: Inverse variance portfolio within clusters
-cov = returns_monthly[sorted_tickers].cov().values * 12
-inv_diag = 1 / np.diag(cov)
-weights = inv_diag / np.sum(inv_diag)
+# --- Step 3: Covariance matrix ---
+cov = returns_monthly[sorted_tickers].cov().values * 12  # annualize
 
-# Map back to original order
+# --- Step 4: Compute HRP weights ---
+hrp_weights_series = recursive_bisect(cov, np.arange(len(sorted_tickers)))
+
+# Map weights to original ETF symbol order
 hrp_weights = np.zeros(len(etf_symbols))
-for i, idx in enumerate(sort_ix):
-    hrp_weights[idx] = weights[i]
+for i, ticker in enumerate(sorted_tickers):
+    original_idx = etf_symbols.index(ticker)
+    hrp_weights[original_idx] = hrp_weights_series[i]
 
+# --- Display ---
 print("Optimal HRP Portfolio Weights:")
 for i, wt in enumerate(hrp_weights):
     if wt > 0.01:
         print(f"  - {etf_symbols[i]}: {wt:.1%}")
 
-# Compute cumulative returns
-hrp_returns = returns_monthly[etf_symbols] @ hrp_weights
-cum_hrp = (1 + hrp_returns).cumprod()
+# --- Optional: Dendrogram visualization ---
+def plot_dendrogram(link, labels):
+    plt.figure(figsize=(10, 4))
+    dendrogram(link, labels=labels, leaf_rotation=90)
+    plt.title("HRP Asset Clustering (Dendrogram)")
+    plt.tight_layout()
+    plt.show()
 
+plot_dendrogram(link, [etf_symbols[i] for i in sort_ix])
 
 # ==============================================================================
 # SECTION 5: REGIME-SWITCHING MODEL
@@ -1034,6 +1123,7 @@ strategies = {
     'Static Shrunk (Sigma-Match)': (returns_final[etf_symbols] @ w_sigma_shrunk) if w_sigma_shrunk is not None else pd.Series(np.nan, index=returns_final.index),
     'Static Resampled': (returns_final[etf_symbols] @ w_resampled) if w_resampled is not None else pd.Series(np.nan, index=returns_final.index),
     'Black-Litterman': (returns_final[etf_symbols] @ w_bl_opt) if 'w_bl_opt' in globals() else pd.Series(np.nan, index=returns_final.index),
+    'Risk Parity Optimization': (returns_final[etf_symbols] @ rp_weights) if 'rp_weights' in globals() else pd.Series(np.nan, index=returns_final.index),
     'Hierarchical Risk Parity': (returns_final[etf_symbols] @ hrp_weights) if 'hrp_weights' in globals() else pd.Series(np.nan, index=returns_final.index),
     'Dynamic Regime Strategy': dynamic_returns_series
 }
