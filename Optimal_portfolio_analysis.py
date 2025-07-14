@@ -81,6 +81,9 @@ from scipy.spatial.distance import squareform
 from scipy.optimize import minimize
 import cvxpy as cp
 
+from arch.univariate import ConstantMean, GARCH
+from arch.multivariate import DCC
+
 from sklearn.covariance import LedoitWolf
 from pandas_datareader.data import DataReader
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
@@ -499,49 +502,7 @@ plt.show()
 # ==============================================================================
 print("\n--- Section 4: Performing Robustness Checks ---")
 
-# --- 4a. Monte Carlo Simulation ---
-# We simulate future returns to see how our portfolios might perform under a wide
-# range of possible outcomes, based on the historical return distribution.
-print(f"Running Monte Carlo simulation with {MC_SIM_SCENARIOS} scenarios...")
-
-# Use monthly parameters for the simulation
-monthly_mu_sample = annual_mu / 12
-
-rng = np.random.default_rng(seed=42)
-simulated_returns_monthly = rng.multivariate_normal(
-    mean=monthly_mu_sample,
-    cov=sample_cov,
-    size=(MC_SIM_SCENARIOS, MC_SIM_HORIZON_MONTHS)
-)
-
-def simulate_performance(weights):
-    """Calculates performance metrics from simulated returns."""
-    if weights is None:
-        return {'mean': np.nan, 'vol': np.nan, 'VaR_5': np.nan}
-    # Calculate portfolio returns for each scenario and time step.
-    portfolio_sim_returns = simulated_returns_monthly @ weights
-    # Annualize the results
-    annual_mean_return = np.mean(portfolio_sim_returns) * 12
-    annual_volatility = np.std(portfolio_sim_returns) * np.sqrt(12)
-    # Value-at-Risk (VaR): The worst expected loss at a 5% confidence level.
-    var_5_percent = np.percentile(portfolio_sim_returns, 5) * 12
-    return {
-        'mean': annual_mean_return,
-        'vol': annual_volatility,
-        'VaR_5': var_5_percent
-    }
-
-# Compare simulated performance of Sigma-matched portfolios vs. the benchmark
-perf_sigma = {
-    'Raw': simulate_performance(w_sigma_raw),
-    'Shrunk': simulate_performance(w_sigma_shrunk),
-    'VOO': {'mean': voo_mu_annual, 'vol': voo_sigma_annual, 'VaR_5': np.nan} # VOO is the baseline
-}
-print("\nSimulated Performance Summary (Sigma-matched to VOO):")
-print(pd.DataFrame(perf_sigma).T)
-
-
-# --- 4b. Resampled Efficient Frontier (Bootstrapping) ---
+# --- 4a. Resampled Efficient Frontier (Bootstrapping) ---
 # This technique addresses "estimation error" by creating many new return datasets
 # via bootstrapping (sampling with replacement). An optimal portfolio is found for
 # each bootstrapped sample, and the final portfolio is the average of all these
@@ -590,7 +551,7 @@ else:
     print("\nCould not generate a resampled portfolio.")
 
 
-# --- 4c. Rolling Window Estimation ---
+# --- 4b. Rolling Window Estimation ---
 # This analysis shows how the optimal portfolio allocation would have changed over time
 # as new data became available, providing insight into the strategy's stability.
 print(f"\nPerforming Rolling Window analysis with a {ROLLING_WINDOW_MONTHS}-month window...")
@@ -634,7 +595,7 @@ if rolling_weights_list:
     plt.show()
 
 
-# --- 4d. Black-Litterman  ---
+# --- 4c. Black-Litterman  ---
 # This implementation uses a data-driven prior: a shrinkage estimator that blends
 # the sample mean and an equal-mean neutral vector. The investor expresses a single
 # view that VEA will outperform VWO by 1% annualized, which is encoded via matrix P and vector Q.
@@ -673,12 +634,25 @@ for i, wt in enumerate(w_bl_opt):
     if wt > 0.01:
         print(f"  - {etf_symbols[i]}: {wt:.1%}")
 
-# --- 4e. Risk Parity (HRP) ---
+
+# The final resampled portfolio is the average of the weights from all iterations.
+if resampled_weights_list:
+    w_resampled = np.mean(resampled_weights_list, axis=0)
+    top_indices = np.argsort(w_resampled)[-5:][::-1]
+    print("\nTop 5 ETFs for Resampled Portfolio:")
+    for i in top_indices:
+        symbol = etf_symbols[i]
+        name = etf_name_map.get(symbol, 'Unknown')
+        print(f"  {symbol} ({name}): {w_resampled[i]:.2%}")
+else:
+    w_resampled = None
+    print("\nCould not generate a resampled portfolio.")
+
+
+# --- 4d. Risk Parity  ---
 print("\n--- Risk Parity Portfolio Optimization ---")
 
-
 # --- Define functions for risk and risk contributions ---
-
 # Portfolio standard deviation
 def portfolio_vol(weights, cov):
     return np.sqrt(weights.T @ cov @ weights)
@@ -719,6 +693,14 @@ result = minimize(
 
 rp_weights = result.x
 
+# --- Top 5 ETFs for Risk Parity Portfolio ---
+top_indices = np.argsort(rp_weights)[-5:][::-1]
+print("\nTop 5 ETFs for Risk Parity Portfolio:")
+for i in top_indices:
+    symbol = etf_symbols[i]
+    name = etf_name_map.get(symbol, 'Unknown')
+    print(f"  {symbol} ({name}): {rp_weights[i]:.2%}")
+
 # --- Display results ---
 print("Optimal Risk Parity Portfolio Weights:")
 for i, wt in enumerate(rp_weights):
@@ -726,7 +708,7 @@ for i, wt in enumerate(rp_weights):
         print(f"  - {etf_symbols[i]}: {wt:.1%}")
 
 
-# --- 4f. Hierarchical Risk Parity (HRP) ---
+# --- 4e. Hierarchical Risk Parity (HRP) ---
 print("\n--- Hierarchical Risk Parity Portfolio Optimization ---")
 
 # --- Helper: Correlation to distance ---
@@ -785,11 +767,21 @@ for i, ticker in enumerate(sorted_tickers):
     original_idx = etf_symbols.index(ticker)
     hrp_weights[original_idx] = hrp_weights_series[i]
 
+# --- Top 5 ETFs for HRP Portfolio ---
+top_indices = np.argsort(hrp_weights)[-5:][::-1]
+print("\nTop 5 ETFs for HRP Portfolio:")
+for i in top_indices:
+    symbol = etf_symbols[i]
+    name = etf_name_map.get(symbol, 'Unknown')
+    print(f"  {symbol} ({name}): {hrp_weights[i]:.2%}")
+
+
 # --- Display ---
 print("Optimal HRP Portfolio Weights:")
 for i, wt in enumerate(hrp_weights):
     if wt > 0.01:
         print(f"  - {etf_symbols[i]}: {wt:.1%}")
+
 
 # --- Optional: Dendrogram visualization ---
 def plot_dendrogram(link, labels):
@@ -800,6 +792,109 @@ def plot_dendrogram(link, labels):
     plt.show()
 
 plot_dendrogram(link, [etf_symbols[i] for i in sort_ix])
+
+# --- 4g. DCC-GARCH Portfolio Optimization ---
+print("\n--- Rolling DCC-GARCH Optimization (Weekly Returns, Monthly Weights) ---")
+
+# --- Step 1: Download weekly data ---
+start_date = returns_monthly.index.min()
+
+price_weekly = yf.download(etf_symbols, start=start_date, interval='1wk', auto_adjust=True)['Adj Close']
+price_weekly = price_weekly.dropna()
+
+returns_weekly = np.log(price_weekly / price_weekly.shift(1)).dropna()
+
+# --- Step 2: Define monthly end dates for evaluation ---
+month_ends = returns_weekly.resample('M').last().index
+voo_sigma_annual = returns_weekly['VOO'].std() * np.sqrt(52)
+
+# --- Step 3: Rolling DCC Optimization ---
+rolling_weights_list = []
+
+for date in month_ends:
+    data_cut = returns_weekly.loc[:date]
+    if len(data_cut) < 52:
+        continue
+
+    try:
+        # Fit univariate GARCH models
+        garch_models = []
+        for symbol in etf_symbols:
+            am = ConstantMean(data_cut[symbol])
+            am.volatility = GARCH(1, 1)
+            res = am.fit(disp='off')
+            garch_models.append(res)
+
+        # Fit DCC model
+        dcc = DCC(garch_models)
+        dcc_res = dcc.fit(disp='off')
+
+        # Forecast 1-week-ahead covariance
+        cov_dcc = dcc_res.forecast(horizon=1).cov.iloc[0, 0] * 52
+        mu_dcc = data_cut.mean().values * 52
+
+        # Select volatility-matched portfolio
+        ef_dcc = efficient_frontier(cov_dcc, mu_dcc)
+        _, weights = select_portfolio(ef_dcc, 'sigma', voo_sigma_annual)
+
+        weight_series = pd.Series(weights, index=etf_symbols, name=date)
+        rolling_weights_list.append(weight_series)
+
+        print(f"Optimized DCC portfolio at {date.date()}")
+
+    except Exception as e:
+        print(f"Skipped {date.date()} due to error: {e}")
+
+# --- Step 4: Plot top 5 ETF weights over time ---
+if rolling_weights_list:
+    rolling_weights_df = pd.concat(rolling_weights_list, axis=1).T
+    top_etfs = rolling_weights_df.mean().sort_values(ascending=False).head(5).index
+
+    rolling_weights_df[top_etfs].plot(
+        figsize=(12, 7),
+        title='Top 5 ETF Weights Over Time (DCC-GARCH Optimization)'
+    )
+    plt.ylabel("Portfolio Weight")
+    plt.xlabel("Date")
+    plt.grid(True, linestyle='--')
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No successful DCC-GARCH optimizations.")
+
+# --- Step 5: Construct Monthly Weights Aligned with returns_final.index ---
+
+# Initialize empty DataFrame with returns_final index
+dcc_monthly_weights = pd.DataFrame(index=returns_monthly.index, 
+                                   columns=etf_symbols, 
+                                   dtype=float)
+
+# Loop through each set of optimized weights
+for date, weights in rolling_weights_df.iterrows():
+    # Find the next date in returns_final.index that comes after the optimization date
+    future_idx = returns_monthly.index[returns_monthly.index > date]
+    if not future_idx.empty:
+        dcc_monthly_weights.loc[future_idx[0]] = weights.values
+
+# Optional: forward-fill missing months for continuous exposure
+# dcc_monthly_weights = dcc_monthly_weights.ffill()
+
+# Sanity check
+print("\nSample of DCC-GARCH Monthly Weights aligned with returns_monthly:")
+print(dcc_monthly_weights.dropna().head(3).round(4))
+
+# --- Step 6: Calculate Dynamic Return Series for DCC-GARCH Strategy ---
+
+# Ensure weights and returns align properly
+valid_mask = ~dcc_monthly_weights.isna().any(axis=1)
+aligned_weights = dcc_monthly_weights[valid_mask]
+aligned_returns = returns_monthly.loc[aligned_weights.index, etf_symbols]
+
+# Compute monthly portfolio returns from the dynamic weights
+dynamic_port_returns = np.sum(aligned_weights.values * aligned_returns.values, axis=1)
+dynamic_returns_series_dcc = pd.Series(dynamic_port_returns, index=aligned_weights.index)
+
+
 
 # ==============================================================================
 # SECTION 5: REGIME-SWITCHING MODEL
@@ -1030,12 +1125,13 @@ for i in range(best_k):
 
     if w_opt is not None:
         regime_optimal_weights[i] = w_opt
-        print(f"  > Optimal Portfolio for Regime {i} (matching VOO vol):")
-        top_indices = np.argsort(w_opt)[-3:][::-1]
+        print(f"  > Top 5 ETFs for Regime {i} Portfolio (matching VOO vol):")
+        top_indices = np.argsort(w_opt)[-5:][::-1]
         for idx in top_indices:
-            if w_opt[idx] > 0.01:
-                print(f"    - {etf_symbols[idx]}: {w_opt[idx]:.1%}")
-
+            symbol = etf_symbols[idx]
+            name = etf_name_map.get(symbol, 'Unknown')
+            print(f"    {symbol} ({name}): {w_opt[idx]:.2%}")
+    
         # Plot the frontier and the selected optimal point.
         plt.plot(ef_regime['sigma'], ef_regime['mu'], label=f'Regime {i} Frontier', color=colors[i], lw=2)
         opt_sigma = np.sqrt(w_opt @ cov_regime @ w_opt)
@@ -1054,6 +1150,7 @@ plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
+
 
 # --- 6b. Backtest the Dynamic Strategy ---
 # At each month, our portfolio is a blend of the regime-optimal portfolios,
@@ -1125,6 +1222,7 @@ strategies = {
     'Black-Litterman': (returns_final[etf_symbols] @ w_bl_opt) if 'w_bl_opt' in globals() else pd.Series(np.nan, index=returns_final.index),
     'Risk Parity Optimization': (returns_final[etf_symbols] @ rp_weights) if 'rp_weights' in globals() else pd.Series(np.nan, index=returns_final.index),
     'Hierarchical Risk Parity': (returns_final[etf_symbols] @ hrp_weights) if 'hrp_weights' in globals() else pd.Series(np.nan, index=returns_final.index),
+    'DCC-GARCH': dynamic_returns_series_dcc,
     'Dynamic Regime Strategy': dynamic_returns_series
 }
 
@@ -1204,5 +1302,55 @@ axes[1].grid(True, linestyle='--', alpha=0.5)
 plt.xlabel("Date")
 plt.tight_layout()
 plt.show()
+
+# --- 7f. Monte Carlo Simulation ---
+# We simulate future returns to see how our portfolios might perform under a wide
+# range of possible outcomes, based on the historical return distribution.
+print(f"Running Monte Carlo simulation with {MC_SIM_SCENARIOS} scenarios...")
+
+# Use monthly parameters for the simulation
+monthly_mu_sample = annual_mu / 12
+
+rng = np.random.default_rng(seed=42)
+simulated_returns_monthly = rng.multivariate_normal(
+    mean=monthly_mu_sample,
+    cov=sample_cov,
+    size=(MC_SIM_SCENARIOS, MC_SIM_HORIZON_MONTHS)
+)
+
+def simulate_performance(weights):
+    """Calculates performance metrics from simulated returns."""
+    if weights is None:
+        return {'mean': np.nan, 'vol': np.nan, 'VaR_5': np.nan}
+    # Calculate portfolio returns for each scenario and time step.
+    portfolio_sim_returns = simulated_returns_monthly @ weights
+    # Annualize the results
+    annual_mean_return = np.mean(portfolio_sim_returns) * 12
+    annual_volatility = np.std(portfolio_sim_returns) * np.sqrt(12)
+    # Value-at-Risk (VaR): The worst expected loss at a 5% confidence level.
+    var_5_percent = np.percentile(portfolio_sim_returns, 5) * 12
+    return {
+        'mean': annual_mean_return,
+        'vol': annual_volatility,
+        'VaR_5': var_5_percent
+    }
+
+# --- Define VOO-only portfolio weights ---
+voo_weights = np.array([1.0 if symbol == 'VOO' else 0.0 for symbol in etf_symbols])
+
+# Compare simulated performance of Sigma-matched portfolios vs. the benchmark
+perf_sigma = {
+    'VOO Benchmark': simulate_performance(voo_weights),
+    'Static Raw (Sigma-Match)': simulate_performance(w_sigma_raw),
+    'Static Shrunk (Sigma-Match)': simulate_performance(w_sigma_shrunk),
+    'Static Resampled': simulate_performance(w_resampled), 
+    'Black-Litterman': simulate_performance(w_bl_opt), 
+    'Risk Parity Optimization': simulate_performance(rp_weights), 
+    'Hierarchical Risk Parity': simulate_performance(hrp_weights)
+}
+print("\nSimulated Performance Summary (Sigma-matched to VOO):")
+print(pd.DataFrame(perf_sigma).T)
+
+
 
 
