@@ -81,8 +81,10 @@ from scipy.spatial.distance import squareform
 from scipy.optimize import minimize
 import cvxpy as cp
 
+from arch import arch_model
 from arch.univariate import ConstantMean, GARCH
 from arch.multivariate import DCC
+from statsmodels.stats.diagnostic import het_arch
 
 from sklearn.covariance import LedoitWolf
 from pandas_datareader.data import DataReader
@@ -803,6 +805,32 @@ price_weekly = yf.download(etf_symbols, start=start_date, interval='1wk', auto_a
 price_weekly = price_weekly.dropna()
 
 returns_weekly = np.log(price_weekly / price_weekly.shift(1)).dropna()
+
+print("\n--- Testing for GARCH(1,1) Effects in Weekly Returns ---")
+
+for symbol in etf_symbols:
+    series = returns_weekly[symbol].dropna()
+
+    # ARCH LM Test
+    lm_test = het_arch(series, nlags=12)
+    pval = lm_test[1]
+
+    print(f"{symbol}: ARCH LM Test p-value = {pval:.4f}")
+    
+    if pval < 0.05:
+        print(f"  → ARCH effects detected (GARCH model may be appropriate)\n")
+    else:
+        print(f"  → No significant ARCH effect (GARCH may not improve)\n")
+
+    # Optional: Visual check of volatility clustering
+    fig, ax = plt.subplots(2, 1, figsize=(10, 4), sharex=True)
+    ax[0].plot(series, label='Returns')
+    ax[0].set_title(f'{symbol} Weekly Returns')
+    ax[1].plot(series**2, label='Squared Returns', color='red')
+    ax[1].set_title(f'{symbol} Squared Returns (Volatility Clustering Check)')
+    plt.tight_layout()
+    plt.show()
+
 
 # --- Step 2: Define monthly end dates for evaluation ---
 month_ends = returns_weekly.resample('M').last().index
