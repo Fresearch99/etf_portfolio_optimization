@@ -341,61 +341,117 @@ print("Annualized Expected Returns (Sample):")
 print(pd.Series(annual_mu, index=etf_symbols).round(4))
 
 
-# --- 3c. Define the Efficient Frontier Optimizer ---
-def efficient_frontier(cov_mat, mu_vec, n_points=50):
+# --- 3c. Define the Efficient Frontier Optimizer with L1 Regularization ---
+def efficient_frontier(cov_mat, mu_vec, n_points=50, lambda_l1=0.002):
     """
-    Calculates the efficient frontier using the Markowitz model. The "Efficient
-    Frontier" is the set of portfolios that provide the highest expected return
-    for a given level of risk (volatility).
+    Calculates the efficient frontier using the Markowitz model with L1
+    regularization (LASSO). This technique encourages sparse portfolios by
+    driving the weights of less important assets to exactly zero.
 
-    This function uses the CVXOPT quadratic programming solver to find portfolio
-    weights that minimize variance for a range of target returns.
+    This function reformulates the L1-regularized problem into a standard
+    Quadratic Program (QP) that can be solved efficiently by CVXOPT.
 
     Args:
         cov_mat (np.array): The annualized covariance matrix of asset returns.
         mu_vec (np.array): The annualized vector of expected asset returns.
         n_points (int): The number of points to calculate along the frontier.
+        lambda_l1 (float): The regularization strength. Higher values lead to
+                           more sparsity (more zero weights).
 
     Returns:
         dict: A dictionary containing returns ('mu'), volatilities ('sigma'),
               and portfolio weights ('weights') for each point on the frontier.
     """
     n_assets = len(mu_vec)
-    # The optimization problem is to minimize: (1/2) * w' * P * w
-    # subject to constraints. Here, P is the covariance matrix.
-    P = opt.matrix(cov_mat)
-    q = opt.matrix(np.zeros((n_assets, 1)))  # No linear term in the objective
 
-    # Constraints:
-    # 1. Weights must be non-negative (G*w <= h). We define -w_i <= 0 for each asset.
-    # 2. Weights must be <= 1. We define w_i <= 1 for each asset.
-    G = opt.matrix(np.vstack([-np.eye(n_assets), np.eye(n_assets)]))
-    h = opt.matrix(np.vstack([np.zeros((n_assets, 1)), np.ones((n_assets, 1))]))
-    
-    # Equality Constraints (A*w = b):
-    # 1. Sum of weights must equal 1.
-    # 2. Portfolio return must equal the target return.
-    A = opt.matrix(np.vstack([mu_vec, np.ones((1, n_assets))]))
+    # --- L1 REFORMULATION SETUP ---
+    # We solve for a combined variable vector x = [w, u] of size 2*n_assets, where:
+    # w: the standard portfolio weights (n_assets)
+    # u: auxiliary variables to handle the absolute value |w_i| (n_assets)
+
+    # 1. The Quadratic Term P
+    # The objective is (1/2)*w'*P*w. In the new system with x=[w,u], this
+    # term only involves 'w'. So, P_new has the original cov_mat in the
+    # top-left block and zeros elsewhere.
+    P_l1 = opt.matrix(np.block([
+        [cov_mat, np.zeros((n_assets, n_assets))],
+        [np.zeros((n_assets, n_assets)), np.zeros((n_assets, n_assets))]
+    ]))
+
+    # 2. The Linear Term q
+    # The L1 penalty `lambda * sum(|w_i|)` is reformulated as `lambda * sum(u_i)`.
+    # This becomes the linear part of the objective, q'*x. The 'w' part of q
+    # is zero, and the 'u' part is lambda.
+    q_l1 = opt.matrix(np.concatenate([np.zeros(n_assets), lambda_l1 * np.ones(n_assets)]))
+
+    # 3. The Inequality Constraints G and h (for Gx <= h)
+    # These constraints link 'w' and 'u' to enforce u_i >= |w_i|.
+    # We also keep the original constraints w_i >= 0 and w_i <= 1.
+    # a) w_i - u_i <= 0
+    # b) -w_i - u_i <= 0  (These two together mean u_i >= |w_i|)
+    # c) -w_i <= 0        (Original non-negativity)
+    # d) w_i <= 1         (Original upper bound)
+    I = np.eye(n_assets)
+    Z = np.zeros((n_assets, n_assets))
+    G_l1 = opt.matrix(np.block([
+        [ I, -I],    # For constraint a)
+        [-I, -I],    # For constraint b)
+        [-I,  Z],    # For constraint c)
+        [ I,  Z]     # For constraint d)
+    ]))
+    h_l1 = opt.matrix(np.concatenate([
+        np.zeros(n_assets),
+        np.zeros(n_assets),
+        np.zeros(n_assets),
+        np.ones(n_assets)
+    ]))
+
+    # 4. The Equality Constraints A and b (for Ax = b)
+    # These constraints (sum of weights = 1, portfolio return = target)
+    # only apply to the 'w' part of our variable vector 'x'.
+    A_l1 = opt.matrix(np.block([
+        [mu_vec,         np.zeros((1, n_assets))],
+        [np.ones((1, n_assets)), np.zeros((1, n_assets))]
+    ]))
+    # --- END OF L1 REFORMULATION SETUP ---
 
     # Iterate through a range of target returns to trace the frontier.
     target_mus = np.linspace(mu_vec.min(), mu_vec.max(), n_points)
     frontier = {'mu': [], 'sigma': [], 'weights': []}
 
     for mu_target in target_mus:
-        b = opt.matrix([mu_target, 1.0])
+        # The RHS of the equality constraint
+        b_l1 = opt.matrix([mu_target, 1.0])
+
         try:
-            solution = opt.solvers.qp(P, q, G, h, A, b)
+            # Solve the larger, reformulated QP problem
+            solution = opt.solvers.qp(P_l1, q_l1, G_l1, h_l1, A_l1, b_l1)
             if solution['status'] == 'optimal':
-                weights = np.array(solution['x']).flatten()
+                # Extract only the weights 'w' from the solution vector 'x'.
+                # The first n_assets elements are the weights we care about.
+                weights = np.array(solution['x'][:n_assets]).flatten()
+
+                # Due to solver precision, weights intended to be zero might be
+                # very small (e.g., 1e-9). We clean them up.
+                weights[np.abs(weights) < 1e-7] = 0
+                
+                # It's good practice to re-normalize after cleanup, though the
+                # sum should already be very close to 1.
+                if np.sum(weights) > 0:
+                    weights /= np.sum(weights)
+
                 sigma = np.sqrt(weights.T @ cov_mat @ weights)
-                frontier['mu'].append(mu_target)
+                # We use the actual achieved return after cleanup for accuracy
+                actual_mu = weights.T @ mu_vec
+
+                frontier['mu'].append(actual_mu)
                 frontier['sigma'].append(sigma)
                 frontier['weights'].append(weights)
         except ValueError:
             # Solver may fail if no feasible solution exists for a target return.
             pass
-    return frontier
 
+    return frontier
 
 # --- 3d. Define Benchmark and Helper Functions ---
 voo_returns_monthly = returns_monthly['VOO']
