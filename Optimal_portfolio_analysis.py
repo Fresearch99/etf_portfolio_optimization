@@ -583,22 +583,24 @@ lambda_shrink = 0.2  # Shrinkage intensity towards the grand mean
 pi = lambda_shrink * annual_mu_sample + (1 - lambda_shrink) * neutral_mean
 
 # 2. Specify Investor Views
-# View 1: VEA will outperform VWO by 1% annually.
+# View 1: Every other ETF’s expected return is about the same as VOO’s.
 # P matrix selects the assets involved in the view.
 # Q vector contains the expected outperformance.
 # We map symbols to their index in the 'etf_symbols' list.
 try:
-    vea_idx = etf_symbols.index('VEA')
-    vwo_idx = etf_symbols.index('VWO')
-    
-    P = np.zeros((1, n_assets))
-    P[0, vea_idx] = 1
-    P[0, vwo_idx] = -1
-    Q = np.array([0.01])  # Expected outperformance of 1%
+    voo_idx = etf_symbols.index('VOO')
+    rows    = [t for t in etf_symbols if t != "VOO"]
 
+    P = np.zeros((len(rows), n_assets))
+    for k, t in enumerate(rows):
+        P[k, returns_monthly.columns.get_loc(t)] =  1
+        P[k, voo_idx]                       = -1        # relative to VOO
+
+    Q  = np.zeros(len(rows))                            # “≈ 0” differences
+ 
     # 3. Define Uncertainty in Views (Omega matrix)
     # A diagonal matrix where smaller values mean higher confidence in the view.
-    omega = np.diag([0.0025]) # Moderate confidence in the view
+    omega = np.diag(np.full(len(Q), 0.005))             # big ⇒ soft view
     
     # 4. Combine Priors and Views to get Posterior Returns (m_bl)
     # The 'tau' parameter scales the uncertainty of the prior.
@@ -619,6 +621,7 @@ try:
     problem.solve()
     w_bl_opt = w_bl.value
     
+        
     print("Optimal Black-Litterman Portfolio (all weights > 1%):")
     for i, weight in enumerate(w_bl_opt):
         if weight > 0.01:
