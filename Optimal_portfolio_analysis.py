@@ -24,6 +24,7 @@
 #       -   Calculates expected returns and covariance, applying "shrinkage"
 #           techniques (Ledoit-Wolf) for more stable estimates.
 #       -   Computes the "Efficient Frontier" to find optimal portfolios.
+#       -   Apply L1 regularization to remove small weights.
 #       -   Constructs several static portfolios and compares them to a benchmark (VOO).
 #
 #   4.  ADVANCED STATIC MODELS & ROBUSTNESS CHECKS:
@@ -342,7 +343,7 @@ print(pd.Series(annual_mu, index=etf_symbols).round(4))
 
 
 # --- 3c. Define the Efficient Frontier Optimizer with L1 Regularization ---
-def efficient_frontier(cov_mat, mu_vec, n_points=50, lambda_l1=0.002):
+def efficient_frontier(cov_mat, mu_vec, n_points=50, lambda_l1=0.000):
     """
     Calculates the efficient frontier using the Markowitz model with L1
     regularization (LASSO). This technique encourages sparse portfolios by
@@ -477,16 +478,73 @@ def select_portfolio(frontier, target_metric, target_value):
     return idx, frontier['weights'][idx]
 
 
+# ================================================================
+#  Minimal grid-search for the “best” L1-penalty (λ₁)             
+#  -------------------------------------------------------------- 
+#  • One train / validation split (last 20 % = validation).        
+#  • Metric = out-of-sample Sharpe (annualised).                   
+#  • Frontier builder must accept `lambda_l1` kw-arg,              
+#    e.g. `efficient_frontier(cov, mu, n_points, lambda_l1=λ)`.    
+# ================================================================
+
+# ----- user inputs ---------------------------------------------------------
+lambda_grid = np.logspace(-5, -2, 9)        # 1e-5 … 1e-2
+val_frac    = 0.20                          # 20 % of history for validation
+target_sig  = voo_sigma_annual              # match VOO’s σ on the frontier
+
+# ----- split data ----------------------------------------------------------
+T = len(returns_monthly)
+split = int((1 - val_frac) * T)
+
+ret_train = returns_monthly.iloc[:split]
+ret_val   = returns_monthly.iloc[split:]
+
+mu_tr  = ret_train.mean().values  * 12
+cov_tr = ret_train.cov().values   * 12
+mu_va  = ret_val.mean().values    * 12
+cov_va = ret_val.cov().values     * 12
+
+# ----- helper --------------------------------------------------------------
+def sharpe_ratio(mu, sigma):
+    """μ,σ already annualised → return annual Sharpe (rf=0)."""
+    return mu / sigma if sigma > 0 else np.nan
+
+def eval_lambda(lam):
+    """Fit frontier with λ₁=lam on train-set, score on validation."""
+    front = efficient_frontier(cov_tr, mu_tr, n_points=30, lambda_l1=lam)
+    _, w  = select_portfolio(front, 'sigma', target_sig)
+    if w is None:
+        return np.nan
+
+    mu_oos = w @ mu_va
+    sig_oos = np.sqrt(w @ cov_va @ w)
+    return sharpe_ratio(mu_oos, sig_oos)
+
+# ----- grid search ---------------------------------------------------------
+scores = [eval_lambda(lam) for lam in lambda_grid]
+best_idx = int(np.nanargmax(scores))
+best_lambda = float(lambda_grid[best_idx])
+
+# ----- report --------------------------------------------------------------
+print("λ₁ candidates :", [f"{l:.5g}" for l in lambda_grid])
+print("val Sharpe     :", [f"{s:.3f}"  for s in scores])
+print(f"\n→ selected λ₁ = {best_lambda:.5g}\n")
+
+
 # --- 3e. Generate Frontiers and Select Key Portfolios ---
 print("\nGenerating efficient frontiers...")
 # Frontier using simple sample estimates
 ef_raw = efficient_frontier(annual_cov_sample, annual_mu, n_points=FRONTIER_POINTS)
+# Frontier using L1 regularization to remove small weights
+ef_reg_l1 = efficient_frontier(annual_cov_shrunk, annual_mu, n_points=FRONTIER_POINTS, lambda_l1=best_lambda)
 # Frontier using shrinkage-adjusted covariance
 ef_shrunk = efficient_frontier(annual_cov_shrunk, annual_mu, n_points=FRONTIER_POINTS)
 
 # Find portfolios on each frontier that match the VOO benchmark's risk or return
 _, w_mu_raw = select_portfolio(ef_raw, 'mu', voo_mu_annual)
 _, w_sigma_raw = select_portfolio(ef_raw, 'sigma', voo_sigma_annual)
+_, w_mu_reg_l1 = select_portfolio(ef_reg_l1, 'mu', voo_mu_annual)
+_, w_sigma_reg_l1 = select_portfolio(ef_reg_l1, 'sigma', voo_sigma_annual)
 _, w_mu_shrunk = select_portfolio(ef_shrunk, 'mu', voo_mu_annual)
 _, w_sigma_shrunk = select_portfolio(ef_shrunk, 'sigma', voo_sigma_annual)
 
@@ -494,6 +552,8 @@ _, w_sigma_shrunk = select_portfolio(ef_shrunk, 'sigma', voo_sigma_annual)
 portfolios_to_display = {
     'Raw (Return-Matched)': w_mu_raw,
     'Raw (Risk-Matched)': w_sigma_raw,
+    'L1 Regularized (Return-Matched)': w_mu_reg_l1,
+    'L1 Regularized (Risk-Matched)': w_sigma_reg_l1,
     'Shrunk (Return-Matched)': w_mu_shrunk,
     'Shrunk (Risk-Matched)': w_sigma_shrunk
 }
@@ -514,10 +574,11 @@ for label, weights in portfolios_to_display.items():
 # --- 3f. Plot Static Efficient Frontiers ---
 plt.figure(figsize=(12, 8))
 plt.plot(ef_raw['sigma'], ef_raw['mu'], 'o-', label='Raw Estimate Frontier', alpha=0.7)
+plt.plot(ef_reg_l1['sigma'], ef_reg_l1['mu'], 'o-', label='L1 Regularized Frontier', lw=2)
 plt.plot(ef_shrunk['sigma'], ef_shrunk['mu'], 'o-', label='Shrunk Covariance Frontier', lw=2)
 plt.scatter([voo_sigma_annual], [voo_mu_annual], color='red', marker='X', s=200, label='VOO Benchmark', zorder=5)
 
-plt.title('Efficient Frontiers: Raw vs. Shrunk Covariance', fontsize=16)
+plt.title('Efficient Frontiers: Raw vs. L1 Regularization vs. Shrunk Covariance', fontsize=16)
 plt.xlabel('Annualized Volatility (Risk)', fontsize=12)
 plt.ylabel('Annualized Expected Return', fontsize=12)
 plt.legend()
@@ -1211,6 +1272,7 @@ def calculate_performance_metrics(returns_series):
 strategies = {
     'VOO Benchmark': returns_final['VOO'],
     'Static Raw (Risk-Match)': (returns_final[etf_symbols] @ w_sigma_raw) if w_sigma_raw is not None else pd.Series(dtype=float),
+    'Static L1 Regularized (Risk-Match)': (returns_final[etf_symbols] @ w_sigma_reg_l1) if w_sigma_reg_l1 is not None else pd.Series(dtype=float),
     'Static Shrunk (Risk-Match)': (returns_final[etf_symbols] @ w_sigma_shrunk) if w_sigma_shrunk is not None else pd.Series(dtype=float),
     'Static Resampled': (returns_final[etf_symbols] @ w_resampled) if w_resampled is not None else pd.Series(dtype=float),
     'Black-Litterman': (returns_final[etf_symbols] @ w_bl_opt) if w_bl_opt is not None else pd.Series(dtype=float),
@@ -1308,6 +1370,8 @@ def simulate_portfolio_performance(weights):
 voo_weights = np.array([1.0 if s == 'VOO' else 0.0 for s in etf_symbols])
 simulation_portfolios = {
     'VOO Benchmark': voo_weights,
+    'Static Raw (Risk-Match)': w_sigma_raw,
+    'Static L1 Regularized (Risk-Match)': w_sigma_reg_l1,
     'Static Shrunk (Risk-Match)': w_sigma_shrunk,
     'Static Resampled': w_resampled,
     'Black-Litterman': w_bl_opt,
