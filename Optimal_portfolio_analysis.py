@@ -109,6 +109,11 @@ MAX_REGIMES_TO_TEST = 4       # Test models with 2 up to this number of regimes.
 # --- Initial Setup ---
 # Configure pandas to display floating-point numbers with 3 decimal places for readability.
 pd.set_option('display.float_format', lambda x: f'{x:.3f}')
+
+pd.set_option('display.max_columns', None)   # no column limit
+pd.set_option('display.width',       None)   # auto‑expand to console width
+pd.set_option('display.max_colwidth', None)  # don't truncate long strings
+
 # Configure the CVXOPT solver to not display progress messages during optimization.
 opt.solvers.options['show_progress'] = False
 
@@ -447,6 +452,47 @@ def efficient_frontier(cov_mat, mu_vec, n_points=50, lambda_l1=0.000):
 
     return frontier
 
+# Avoid using lower arms of the M-V frontier
+def prune_frontier(frontier):
+    """
+    Remove dominated points from a mean-variance frontier.
+    Keeps only portfolios whose expected return strictly increases
+    as volatility increases (i.e. the upper arm).
+
+    Parameters
+    ----------
+    frontier : dict with keys 'sigma', 'mu', 'weights'
+
+    Returns
+    -------
+    dict     pruned frontier with the same structure
+    """
+    # Convert to arrays for easy slicing
+    vol   = np.asarray(frontier["sigma"])
+    ret   = np.asarray(frontier["mu"])
+    wlist = list(frontier["weights"])
+
+    # 1) sort by volatility (ascending)
+    order = np.argsort(vol)
+    vol, ret = vol[order], ret[order]
+    wlist    = [wlist[i] for i in order]
+
+    # 2) walk from left to right, keep when return rises
+    keep_idx  = []
+    last_best = -np.inf
+    for i in range(len(ret)):
+        if ret[i] > last_best + 1e-12:       # strictly higher μ
+            keep_idx.append(i)
+            last_best = ret[i]
+
+    # 3) assemble pruned frontier
+    return {
+        "sigma"  : vol[keep_idx].tolist(),
+        "mu"     : ret[keep_idx].tolist(),
+        "weights": [wlist[i] for i in keep_idx],
+    }
+
+
 # --- 3d. Define Benchmark and Helper Functions ---
 voo_returns_monthly = returns_monthly['VOO']
 voo_mu_annual = voo_returns_monthly.mean() * 12 - etf_expense_map.get('VOO', 0.0)
@@ -527,11 +573,14 @@ print(f"\n→ selected λ₁ = {best_lambda:.5g}\n")
 # --- 3e. Generate Frontiers and Select Key Portfolios ---
 print("\nGenerating efficient frontiers...")
 # Frontier using simple sample estimates
-ef_raw = efficient_frontier(annual_cov_sample, annual_mu, n_points=FRONTIER_POINTS)
+ef_raw_pre_pruning = efficient_frontier(annual_cov_sample, annual_mu, n_points=FRONTIER_POINTS)
+ef_raw = prune_frontier(ef_raw_pre_pruning)
 # Frontier using L1 regularization to remove small weights
-ef_reg_l1 = efficient_frontier(annual_cov_shrunk, annual_mu, n_points=FRONTIER_POINTS, lambda_l1=best_lambda)
+ef_reg_l1_pre_pruning = efficient_frontier(annual_cov_shrunk, annual_mu, n_points=FRONTIER_POINTS, lambda_l1=best_lambda)
+ef_reg_l1 = prune_frontier(ef_reg_l1_pre_pruning)
 # Frontier using shrinkage-adjusted covariance
-ef_shrunk = efficient_frontier(annual_cov_shrunk, annual_mu, n_points=FRONTIER_POINTS)
+ef_shrunk_pre_pruning = efficient_frontier(annual_cov_shrunk, annual_mu, n_points=FRONTIER_POINTS)
+ef_shrunk = prune_frontier(ef_shrunk_pre_pruning)
 
 # Find portfolios on each frontier that match the VOO benchmark's risk or return
 _, w_mu_raw = select_portfolio(ef_raw, 'mu', voo_mu_annual)
@@ -689,7 +738,7 @@ print("\n--- Black-Litterman Portfolio Optimization ---")
 # We use a simple data-driven prior: a shrinkage estimate that blends the
 # sample mean with the grand mean of all assets.
 neutral_mean = np.full_like(annual_mu_sample, annual_mu_sample.mean())
-lambda_shrink = 0.2  # Shrinkage intensity towards the grand mean
+lambda_shrink = 0.3  # Shrinkage intensity towards the grand mean
 pi = lambda_shrink * annual_mu_sample + (1 - lambda_shrink) * neutral_mean
 
 # 2. Specify Investor Views
@@ -710,11 +759,11 @@ try:
  
     # 3. Define Uncertainty in Views (Omega matrix)
     # A diagonal matrix where smaller values mean higher confidence in the view.
-    omega = np.diag(np.full(len(Q), 0.005))             # big ⇒ soft view
+    omega = np.diag(np.full(len(Q), 0.02))             # big ⇒ soft view
     
     # 4. Combine Priors and Views to get Posterior Returns (m_bl)
     # The 'tau' parameter scales the uncertainty of the prior.
-    bl_tau = 0.05
+    bl_tau = 0.20
     cov_inv = np.linalg.inv(bl_tau * annual_cov_shrunk)
     omega_inv = np.linalg.inv(omega)
     
@@ -764,6 +813,144 @@ try:
 except (ValueError, IndexError):
     print("Could not perform Black-Litterman: VEA or VWO not in the asset list.")
     w_bl_opt = None
+
+
+# ------------------------------------------------------------
+# Black–Litterman helper (English names, no Greek letters)
+# ------------------------------------------------------------
+def run_black_litterman(shrink_factor=0.3,      # λ  → shrink_factor
+                        tau_prior=0.20,         # τ  → tau_prior
+                        omega_scale=0.02,       # Ω  → omega_scale
+                        print_summary=True):
+    """
+    Black–Litterman optimisation with tunable hyper‑parameters.
+    
+    Parameters
+    ----------
+    shrink_factor : float
+        Weight on the *sample* mean in the prior; 1‑shrink_factor goes to the
+        grand mean of all assets.
+    tau_prior : float
+        Prior‑uncertainty scale.  Larger => prior treated as less certain.
+    omega_scale : float
+        Diagonal element for the Omega matrix (view uncertainty).  Larger =>
+        views are softer / less binding.
+    print_summary : bool
+        If True, prints portfolio weights and top 3 holdings.
+    
+    Returns
+    -------
+    weights_bl : np.ndarray | None
+        Optimal long‑only weights (length = n_assets) or None if optimisation
+        fails.
+    mu_posterior : np.ndarray | None
+        Posterior expected‑return vector or None on failure.
+    """
+    global weights_bl  # optional; keeps backward compatibility
+    n_assets = len(etf_symbols)
+
+    # 1. ----- Prior mean ("pi") --------------------------------------------
+    grand_mean = annual_mu_sample.mean()
+    prior_mean = shrink_factor * annual_mu_sample + (1 - shrink_factor) * grand_mean
+
+    try:
+        # 2. ----- Investor view: each ETF ≈ VOO ----------------------------
+        idx_voo = etf_symbols.index("VOO")
+        other_symbols = [sym for sym in etf_symbols if sym != "VOO"]
+
+        P = np.zeros((len(other_symbols), n_assets))
+        for k, sym in enumerate(other_symbols):
+            P[k, returns_monthly.columns.get_loc(sym)] = 1        # +1 on ETF
+            P[k, idx_voo] = -1                                    # −1 on VOO
+        Q = np.zeros(len(other_symbols))                          # “≈ 0” view
+
+        # 3. ----- View‑uncertainty (Omega) -------------------------------
+        Omega = np.diag(np.full(len(Q), omega_scale))
+
+        # 4. ----- Posterior mean calculation -----------------------------
+        inv_cov_prior = np.linalg.inv(tau_prior * annual_cov_shrunk)
+        inv_Omega     = np.linalg.inv(Omega)
+        middle        = np.linalg.inv(inv_cov_prior + P.T @ inv_Omega @ P)
+        mu_posterior  = middle @ (inv_cov_prior @ prior_mean + P.T @ inv_Omega @ Q)
+
+        # 5. ----- Optimise (mean‑variance, long‑only, Σ = annual_cov_shrunk)
+        P_qp = opt.matrix(annual_cov_shrunk)   
+        q_qp = opt.matrix(-mu_posterior)
+        G_qp = opt.matrix(-np.eye(n_assets))           # w ≥ 0
+        h_qp = opt.matrix(np.zeros(n_assets))
+        A_qp = opt.matrix(np.ones((1, n_assets)))      # Σ w = 1
+        b_qp = opt.matrix(1.0)
+
+        sol = opt.solvers.qp(P_qp, q_qp, G_qp, h_qp, A_qp, b_qp)
+        if sol["status"] != "optimal":
+            raise RuntimeError("CVXOPT status: " + sol["status"])
+
+        weights_bl = np.array(sol["x"]).ravel()
+        weights_bl[weights_bl < 1e-7] = 0
+        weights_bl /= weights_bl.sum()
+
+        if print_summary:
+            print(f"\n--- Black–Litterman (shrink={shrink_factor}, "
+                  f"tau={tau_prior}, omega={omega_scale}) ---")
+            print("Weights > 1 %:")
+            for i, w in enumerate(weights_bl):
+                if w > 0.01:
+                    print(f"  {etf_symbols[i]}: {w:.1%}")
+
+            top_idx = weights_bl.argsort()[-3:][::-1]
+            print("\nTop 3 ETFs:")
+            for i in top_idx:
+                sym  = etf_symbols[i]
+                name = etf_name_map.get(sym, "Unknown")
+                print(f"  {sym} ({name}): {weights_bl[i]:.2%}")
+
+        return weights_bl, mu_posterior
+
+    except (ValueError, IndexError):
+        if print_summary:
+            print("Black–Litterman failed: could not locate VOO.")
+        weights_bl = None
+        return None, None
+
+# ------------------------------------------------------------
+# hyper‑parameter grid search
+# ------------------------------------------------------------
+shrink_grid = [0.2, 0.4, 0.6, 0.8]             # replaces λ
+tau_grid    = [0.05, 0.10, 0.20, 0.30, 0.40]   # replaces τ
+omega_grid  = [0.005, 0.01, 0.02, 0.05]        # replaces Ω
+
+records = []
+for shrink in shrink_grid:
+    for tau in tau_grid:
+        for omega in omega_grid:
+            w, mu_post = run_black_litterman(shrink, tau, omega, print_summary=False)
+            if w is None:
+                continue
+            exp_ret = float(w @ mu_post)
+            vol     = float(np.sqrt(w @ annual_cov_shrunk @ w))
+            sharpe  = exp_ret / vol if vol else np.nan
+            records.append({"shrink": shrink,
+                            "tau": tau,
+                            "omega": omega,
+                            "exp_return": exp_ret,
+                            "vol": vol,
+                            "sharpe": sharpe,
+                            "top_weight": w.max(),
+                            "assets_>1pct": (w > 0.01).sum()})
+
+tune_df = pd.DataFrame(records).sort_values("sharpe", ascending=False)
+pd.set_option("display.max_columns", None)
+print("\nTuning results (top by Sharpe):")
+print(tune_df.head(10))
+
+# ------------------------------------------------------------
+# Choose your favourite parameters and rerun with summary
+# ------------------------------------------------------------
+best_row = tune_df.iloc[0]
+w_bl_opt, mu_bl = run_black_litterman(best_row["shrink"],
+                                      best_row["tau"],
+                                      best_row["omega"],
+                                      print_summary=True)
 
 
 # --- 4d. Risk Parity Optimization ---
@@ -939,7 +1126,6 @@ for i in top_indices:
     name = etf_name_map.get(symbol, 'Unknown')
     print(f"  {symbol} ({name}): {w_tilt[i]:.2%}")
 
-### Stop here review ###
 
 # --- 4f. DCC-GARCH Portfolio Optimization ---
 # Dynamic Conditional Correlation (DCC) GARCH models are advanced time-series
@@ -1043,12 +1229,26 @@ print("\n--- Rolling DCC-GARCH Optimization ---")
 # Step 1: Prepare weekly data for better GARCH model estimation
 start_date = returns_monthly.index.min()
 try:
-    price_weekly = yf.download(etf_symbols, start=start_date, interval='1wk', auto_adjust=True)['Adj Close'].dropna()
-    returns_weekly = np.log(price_weekly / price_weekly.shift(1)).dropna()
+    # Identify relevant tickers
+    surviving_etf_symbols = returns_monthly.columns.tolist()
+    
+    # Pull daily total-return prices for all ETFs in one shot
+    all_prices = (
+        pd.concat([get_total_return_series(t) for t in surviving_etf_symbols], axis=1)
+          .tz_localize(None, axis=0)             # drop timezone
+          .dropna(how="all")                     # keep rows with ≥1 price
+    )
+
+    returns_weekly = (
+        all_prices[surviving_etf_symbols]                  # keep only surviving columns
+          .resample("W-FRI").last().pct_change()
+          .loc[returns_monthly.index.min():]     # align start-date with monthly set
+          .dropna(how="all")                     # drop the very first NA row
+    )
 
     # MODIFICATION: Restored GARCH effects testing routine
     print("\n--- Testing for GARCH(1,1) Effects in Weekly Returns ---")
-    for symbol in etf_symbols:
+    for symbol in surviving_etf_symbols:
         series = returns_weekly[symbol].dropna()
         if len(series) < 20: continue # Not enough data for a meaningful test
         
@@ -1077,12 +1277,16 @@ try:
             # Fit univariate GARCH(1,1) & collect std-residuals / variances
             std_resids = []
             cond_vars  = []
+            
+            scale = 1000.0           # 100× puts weekly returns near “1–10”, better for model fitting
             for s in etf_symbols:
-                am = ConstantMean(data_window[s])
+                series = scale * data_window[s]          # <- rescale
+                am     = ConstantMean(series)
                 am.volatility = GARCH(1, 1)
                 res = am.fit(disp="off")
-                std_resids.append(res.std_resid)
-                cond_vars.append(res.conditional_volatility ** 2)
+                # store *de-scaled* residuals and variances
+                std_resids.append(res.std_resid / scale)
+                cond_vars.append((res.conditional_volatility / scale)**2)
             
             std_resids = np.column_stack(std_resids)           # shape (T, N)
             cond_vars  = np.column_stack(cond_vars)            # shape (T, N)
@@ -1288,7 +1492,9 @@ for i in range(best_k):
     cov_regime = LedoitWolf().fit(returns_regime.values).covariance_ * 12
     
     # Generate the efficient frontier for this regime.
-    ef_regime = efficient_frontier(cov_regime, mu_regime, n_points=FRONTIER_POINTS)
+    ef_regime_pre_pruning = efficient_frontier(cov_regime, mu_regime, n_points=FRONTIER_POINTS)
+    ef_regime = prune_frontier(ef_regime_pre_pruning) # -> we need to be careful here to avoid lower arm optimal portfolios
+    
     regime_frontiers[i] = ef_regime
     
     # Find the optimal portfolio by matching the overall VOO benchmark's volatility.
@@ -1379,7 +1585,7 @@ def calculate_performance_metrics(returns_series):
     
     # Sharpe Ratio (assumes risk-free rate is 0)
     # Measures risk-adjusted return. Higher is better.
-    sharpe = (ann_return / ann_vol) if ann_vol > 0 else np.nan
+    sharpe = sharpe_ratio(ann_return, ann_vol)
     
     # Cumulative returns and drawdown
     cumulative_returns = (1 + returns_series).cumprod()
@@ -1399,35 +1605,52 @@ def calculate_performance_metrics(returns_series):
 # --- 7b. Prepare All Strategy Returns for Comparison ---
 # Calculate the historical returns for each static portfolio to compare them
 # against the dynamic strategies and the VOO benchmark.
+
+# length of comparison window (in years)
+lookback_years = 7
+
+end_date   = max(returns_final.index)
+start_date = end_date - pd.DateOffset(years=lookback_years)
+
+# keep only rows where at least one column is non‑NA
+returns_win = returns_final.loc[start_date:end_date].dropna(how="all")
+
 strategies = {
-    'VOO Benchmark': returns_final['VOO'],
-    'Static Raw (Risk-Match)': (returns_final[etf_symbols] @ w_sigma_raw) if w_sigma_raw is not None else pd.Series(dtype=float),
-    'Static L1 Regularized (Risk-Match)': (returns_final[etf_symbols] @ w_sigma_reg_l1) if w_sigma_reg_l1 is not None else pd.Series(dtype=float),
-    'Static Shrunk (Risk-Match)': (returns_final[etf_symbols] @ w_sigma_shrunk) if w_sigma_shrunk is not None else pd.Series(dtype=float),
-    'Static Resampled': (returns_final[etf_symbols] @ w_resampled) if w_resampled is not None else pd.Series(dtype=float),
-    'Black-Litterman': (returns_final[etf_symbols] @ w_bl_opt) if w_bl_opt is not None else pd.Series(dtype=float),
-    'Risk Parity': (returns_final[etf_symbols] @ rp_weights) if rp_weights is not None else pd.Series(dtype=float),
-    'Hierarchical Risk Parity': (returns_final[etf_symbols] @ hrp_weights) if hrp_weights is not None else pd.Series(dtype=float),
-    'HRP - MV blend VOO Expected Return': (returns_final[etf_symbols] @ w_tilt) if w_tilt is not None else pd.Series(dtype=float),
-    'DCC-GARCH Dynamic': dynamic_returns_series_dcc,
-    'Regime-Aware Dynamic': dynamic_returns_series
+    'VOO Benchmark': returns_win['VOO'],
+    'Static Raw (Risk-Match)': (returns_win[etf_symbols] @ w_sigma_raw) if w_sigma_raw is not None else pd.Series(dtype=float, index=returns_win.index),
+    'Static L1 Regularized (Risk-Match)': (returns_win[etf_symbols] @ w_sigma_reg_l1) if w_sigma_reg_l1 is not None else pd.Series(dtype=float, index=returns_win.index),
+    'Static Shrunk (Risk-Match)': (returns_win[etf_symbols] @ w_sigma_shrunk) if w_sigma_shrunk is not None else pd.Series(dtype=float, index=returns_win.index),
+    'Static Resampled': (returns_win[etf_symbols] @ w_resampled) if w_resampled is not None else pd.Series(dtype=float, index=returns_win.index),
+    'Black-Litterman': (returns_win[etf_symbols] @ w_bl_opt) if w_bl_opt is not None else pd.Series(dtype=float, index=returns_win.index),
+    'Risk Parity': (returns_win[etf_symbols] @ rp_weights) if rp_weights is not None else pd.Series(dtype=float, index=returns_win.index),
+    'Hierarchical Risk Parity': (returns_win[etf_symbols] @ hrp_weights) if hrp_weights is not None else pd.Series(dtype=float, index=returns_win.index),
+    'HRP - MV blend VOO Expected Return': (returns_win[etf_symbols] @ w_tilt) if w_tilt is not None else pd.Series(dtype=float, index=returns_win.index)    ,
+    'DCC-GARCH Dynamic': dynamic_returns_series_dcc.loc[start_date:end_date],
+    'Regime-Aware Dynamic': dynamic_returns_series.loc[start_date:end_date]
 }
 
 # --- 7c. Plot Cumulative Performance and Display Metrics Table ---
 plt.style.use('seaborn-v0_8-whitegrid')
 fig, ax = plt.subplots(figsize=(14, 8))
 
-for name, returns in strategies.items():
-    if not returns.dropna().empty:
-        # Plot cumulative growth of $1
-        (1 + returns).cumprod().plot(ax=ax, label=name, lw=2)
+for name, rtn in strategies.items():
+    if rtn.empty:
+        continue  # skip if the strategy has no data in the window
 
-ax.set_title('Cumulative Performance Comparison of All Strategies', fontsize=16)
-ax.set_xlabel('Date', fontsize=12)
-ax.set_ylabel('Growth of $1 (Log Scale)', fontsize=12)
-ax.set_yscale('log') # Log scale is useful for comparing long-term growth rates.
-ax.legend(loc='upper left', fontsize=10)
-ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    # cumulative performance
+    growth = (1 + rtn).cumprod()
+
+    if name.lower().startswith("voo"):
+        growth.plot(ax=ax, label=name, lw=3, linestyle="--", color="black")
+    else:
+        growth.plot(ax=ax, label=name, lw=2)
+
+ax.set_title(f"Cumulative Performance – last {lookback_years} years", fontsize=16)
+ax.set_xlabel("Date", fontsize=12)
+ax.set_ylabel("Growth of $1 (log scale)", fontsize=12)
+ax.set_yscale("log")
+ax.legend(loc="upper left", fontsize=10)
+ax.grid(True, which="both", linestyle="--", linewidth=0.5)
 plt.tight_layout()
 plt.show()
 
@@ -1488,12 +1711,17 @@ def simulate_portfolio_performance(weights):
     annual_mean_return = np.mean(portfolio_sim_returns) * 12 * 100
     # Std dev of all scenario outcomes
     annual_volatility = np.std(portfolio_sim_returns) * np.sqrt(12) * 100
+    
+    # Sharpe Ratio (assumes risk-free rate is 0)
+    sharpe = sharpe_ratio(annual_mean_return, annual_volatility)
+    
     # Value-at-Risk (VaR): The worst expected loss at a 5% confidence level.
     var_5_percent = np.percentile(portfolio_sim_returns, 5) * 12 * 100
     
     return {
         'Mean Ann. Return (%)': annual_mean_return,
         'Ann. Volatility (%)': annual_volatility,
+        "Sharpe Ratio": sharpe,
         'VaR 5% (Ann.) (%)': var_5_percent
     }
 
@@ -1518,7 +1746,7 @@ sim_results_df = pd.DataFrame(sim_results).T
 print("\n" + "="*70)
 print("      MONTE CARLO SIMULATION SUMMARY (10-YEAR HORIZON)")
 print("="*70)
-print(sim_results_df)
+print(sim_results_df.sort_values(by='Sharpe Ratio', ascending=False))
 print("="*70 + "\n")
 
 print("--- Analysis Complete ---")
