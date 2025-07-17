@@ -69,15 +69,12 @@ import matplotlib.pyplot as plt
 
 # Optimization & Statistical Modeling Libraries
 import cvxopt as opt
-import cvxpy as cp
 import statsmodels.api as sm
 from scipy.optimize import minimize
 from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
 from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
-from arch import arch_model
 from arch.univariate import ConstantMean, GARCH
-from arch.multivariate import DCC
 from statsmodels.stats.diagnostic import het_arch
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from pandas_datareader.data import DataReader
@@ -87,8 +84,6 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-import ipywidgets as widgets
-from IPython.display import display
 
 # --- Global Settings & Constants ---
 # Set the working directory. The chromedriver executable and any local data
@@ -133,7 +128,7 @@ chrome_options = Options()
 chrome_options.add_argument("--headless=new")       # Use the latest headless mode
 chrome_options.add_argument("--disable-gpu")        # Optional: improves stability on some systems
 # Point to the local chromedriver binary (must match your installed Chrome version)
-chrome_service = Service(executable_path="./chromedriver")
+chrome_service = Service(executable_path="/Users/dominikjurek/Library/CloudStorage/Dropbox/Personal/Investment/chromedriver")
 driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
 
 def extract_etf_data_from_page(driver_instance):
@@ -218,8 +213,7 @@ finally:
     # Always close the browser session
     driver.quit()
 
-
-# --- 2b. Filter the ETF Universe ---
+# --- OPTIONAL 2b. Filter the ETF Universe ---
 # To create a diversified portfolio of broad asset classes, we remove
 # specialized, sector-specific ETFs and redundant funds.
 industry_keywords = [
@@ -240,7 +234,6 @@ etf_symbols = [s for s in etf_symbols if not is_industry_or_redundant(s, etf_nam
 # Ensure the list contains only unique symbols
 etf_symbols = list(dict.fromkeys(etf_symbols))
 print(f"\nFiltered down to {len(etf_symbols)} ETFs for analysis.")
-
 
 # --- 2c. Fetch Historical Price Data ---
 def get_total_return_series(ticker):
@@ -290,9 +283,9 @@ cutoff_date = returns_monthly.index.max() - pd.DateOffset(years=ANALYSIS_YEARS)
 returns_monthly = returns_monthly[returns_monthly.index >= cutoff_date]
 
 # Data Cleaning:
-# 1. Drop any ETF (column) that lacks a significant number of data points.
-min_observations = int(len(returns_monthly) * 0.50)
-returns_monthly = returns_monthly.dropna(axis=1, thresh=min_observations)
+# 1. Drop ETFs that do not have ten year of non-NA observations
+MIN_OBSERVATIONS = 10 * 12          
+returns_monthly = returns_monthly.dropna(axis=1, thresh=MIN_OBSERVATIONS)
 # 2. Drop any month (row) that still has missing values after column filtering.
 returns_monthly = returns_monthly.dropna(axis=0)
 
@@ -488,7 +481,7 @@ def select_portfolio(frontier, target_metric, target_value):
 # ================================================================
 
 # ----- user inputs ---------------------------------------------------------
-lambda_grid = np.logspace(-5, -2, 9)        # 1e-5 … 1e-2
+lambda_grid = np.logspace(-6, -1, 11)       # 11 points: 1e-6 … 1e-1
 val_frac    = 0.20                          # 20 % of history for validation
 target_sig  = voo_sigma_annual              # match VOO’s σ on the frontier
 
@@ -730,21 +723,36 @@ try:
     m_bl = M_inv @ (cov_inv @ pi + P.T @ omega_inv @ Q)
 
     # 5. Optimize the portfolio using the new Black-Litterman expected returns.
-    w_bl = cp.Variable(n_assets)
-    # Risk aversion parameter (gamma) implicitly set to 0.5 in the objective
-    objective = cp.Maximize(m_bl @ w_bl - 0.5 * cp.quad_form(w_bl, annual_cov_shrunk))
-    constraints = [cp.sum(w_bl) == 1, w_bl >= 0]
-    problem = cp.Problem(objective, constraints)
-    problem.solve()
-    w_bl_opt = w_bl.value
+    # maximise   m_blᵀ w − ½ · wᵀ Σ w
+    # ⇔ minimise   ½ · wᵀ Σ w  − m_blᵀ w
+    #
+    P_qp = opt.matrix(annual_cov_shrunk)                 # (n × n)
+    q_qp = opt.matrix(-m_bl)                             # (n × 1)
     
+    G_qp = opt.matrix(-np.eye(n_assets))                 #  w ≥ 0
+    h_qp = opt.matrix(np.zeros(n_assets))
+    
+    A_qp = opt.matrix(np.ones((1, n_assets)))            #  1ᵀ w = 1
+    b_qp = opt.matrix(1.0)
+    
+    opt.solvers.options['show_progress'] = False
+    sol   = opt.solvers.qp(P_qp, q_qp, G_qp, h_qp, A_qp, b_qp)
+    
+    if sol['status'] != 'optimal':
+        raise RuntimeError("CVXOPT failed: " + sol['status'])
+    
+    w_bl_opt = np.array(sol['x']).flatten()
+    
+    # Numerical tidying
+    w_bl_opt[np.abs(w_bl_opt) < 1e-7] = 0
+    w_bl_opt /= w_bl_opt.sum()
         
     print("Optimal Black-Litterman Portfolio (all weights > 1%):")
     for i, weight in enumerate(w_bl_opt):
         if weight > 0.01:
             print(f"  - {etf_symbols[i]}: {weight:.1%}")
             
-    # MODIFICATION: Added "Top 3 ETFs" summary
+    # Added "Top 3 ETFs" summary
     if w_bl_opt is not None:
         print("\nTop 3 ETFs for Black-Litterman Portfolio:")
         top_indices = np.argsort(w_bl_opt)[-3:][::-1]
@@ -910,11 +918,127 @@ plt.title("HRP Asset Clustering (Dendrogram)", fontsize=16)
 plt.tight_layout()
 plt.show()
 
+# Blend the HRP portfolio with the portfolio matched to VOO's sigma 
+#   to minimuze the variance and meet VOO's mu.
+mu_hrp = hrp_weights @ annual_mu_sample
+mu_mv  = w_sigma_raw  @ annual_mu_sample
+alpha  = np.clip((voo_mu_annual - mu_hrp) / (mu_mv - mu_hrp + 1e-12), 0, 1)
+
+w_tilt = (1 - alpha) * hrp_weights + alpha * w_sigma_raw
+w_tilt /= w_tilt.sum()
+
+sigma_tilt = np.sqrt(w_tilt @ annual_cov_sample @ w_tilt)
+print(f"\nBlended HRP portfolio: α = {alpha:.3f}")
+print(f"  Expected μ  = {w_tilt @ annual_mu:.2%}  (VOO: {voo_mu_annual:.2%})")
+print(f"  Volatility σ = {sigma_tilt:.2%}        (VOO: {voo_sigma_annual:.2%})")
+
+print("\nTop 3 ETFs for HRP-MV optimal VOO portfolio:")
+top_indices = np.argsort(w_tilt)[-3:][::-1]
+for i in top_indices:
+    symbol = etf_symbols[i]
+    name = etf_name_map.get(symbol, 'Unknown')
+    print(f"  {symbol} ({name}): {w_tilt[i]:.2%}")
+
+### Stop here review ###
 
 # --- 4f. DCC-GARCH Portfolio Optimization ---
 # Dynamic Conditional Correlation (DCC) GARCH models are advanced time-series
 # models that capture time-varying volatility and correlation. This is useful
 # as correlations often spike during market crises.
+
+# ---------------------------------------------------------------------------
+#  Helpers: estimate & forecast a basic Engle (2002) DCC(1,1)
+# ---------------------------------------------------------------------------
+def _dcc_negloglik(params, std_resids):
+    """
+    Negative log-likelihood of a DCC(1,1) model given standardised residuals.
+
+    params = (alpha, beta)  with  0 <= alpha, beta  and  alpha + beta < 1
+    std_resids : (T, N) matrix of standardised residuals (zero mean, unit var)
+    """
+    T, N = std_resids.shape
+    alpha, beta = params
+    Qbar = np.cov(std_resids.T)                # unconditional correlation
+    Qt   = Qbar.copy()                         # initialise Qt_0
+    loglik = 0.0
+
+    for t in range(T):
+        eps_t = std_resids[t][:, None]         # (N,1)
+        Qt     = (1 - alpha - beta) * Qbar + \
+                 alpha * (eps_t @ eps_t.T) + \
+                 beta  * Qt                    # DCC recursion
+
+        # convert Qt → Rt (correlation) and accumulate log-lik
+        diag_sqrt = np.sqrt(np.diag(Qt))
+        # guard against negative or zero values due to floating error
+        diag_sqrt[diag_sqrt <= 0] = 1e-12
+        Rt = Qt / np.outer(diag_sqrt, diag_sqrt)
+        inv_Rt = np.linalg.inv(Rt)
+        logdet_Rt = np.log(np.linalg.det(Rt))
+
+        loglik += logdet_Rt + eps_t.T @ inv_Rt @ eps_t
+
+    return 0.5 * loglik.item()                 # scipy minimises
+
+def fit_dcc(std_resids, bounds=((1e-6, 1-1e-6),)*2):
+    """
+    Estimate (alpha, beta) by QML; returns params and last Qt, Rt.
+    """
+    # quick grid start to avoid local minima
+    best_val, best_ab = np.inf, None
+    grid = np.linspace(0.01, 0.15, 5)
+    for a in grid:
+        for b in grid:
+            if a + b < 0.999:
+                val = _dcc_negloglik((a, b), std_resids)
+                if val < best_val:
+                    best_val, best_ab = val, (a, b)
+
+    res = minimize(_dcc_negloglik,
+                   x0=np.array(best_ab),
+                   args=(std_resids,),
+                   bounds=bounds,
+                   constraints={'type': 'ineq',
+                                'fun': lambda x: 0.999 - x[0] - x[1]})
+    alpha, beta = res.x
+    alpha, beta = float(alpha), float(beta)
+    alpha = max(alpha, 0); beta = max(beta, 0)
+    if alpha + beta >= 0.999:          # enforce stationarity
+        beta = 0.999 - alpha - 1e-6
+    # recompute final Qt & Rt for the last observation
+    Qbar = np.cov(std_resids.T)
+    Qt = Qbar.copy()
+    for eps in std_resids:
+        eps = eps[:, None]
+        Qt = (1 - alpha - beta) * Qbar + alpha * (eps @ eps.T) + beta * Qt
+    Rt = Qt / np.outer(np.sqrt(np.diag(Qt)), np.sqrt(np.diag(Qt)))
+    return alpha, beta, Qt, Rt
+
+def forecast_dcc_cov(std_resids, cond_vars, horizon=1):
+    """
+    Produce a (horizon-step) ahead *annualised* covariance forecast.
+
+    std_resids : (T,N) matrix of residuals / sqrt(cond_vars)  ➜ Rt dynamics
+    cond_vars  : (T,N) matrix of 1-step-ahead GARCH conditional variances
+    """
+    alpha, beta, Qt_last, Rt_last = fit_dcc(std_resids)
+
+    Qbar = np.cov(std_resids.T)
+    Qt_h = Qt_last.copy()
+
+    # propagate Qt forward 'horizon' steps
+    for _ in range(horizon):
+        Qt_h = (1 - alpha - beta) * Qbar + beta * Qt_h  # eps_t term = 0 under Q-forecast
+
+    Rt_h = Qt_h / np.outer(np.sqrt(np.diag(Qt_h)), np.sqrt(np.diag(Qt_h)))
+
+    # Latest 1-step-ahead variances from univariate GARCH models
+    var_h = cond_vars[-1]        # shape (N,)
+
+    cov_h = np.outer(np.sqrt(var_h), np.sqrt(var_h)) * Rt_h
+    return cov_h
+
+
 print("\n--- Rolling DCC-GARCH Optimization ---")
 # Step 1: Prepare weekly data for better GARCH model estimation
 start_date = returns_monthly.index.min()
@@ -950,15 +1074,21 @@ try:
 
         try:
             print(f"Optimizing DCC portfolio for month-end {date.date()}...")
-            # Fit univariate GARCH(1,1) models for each asset
-            garch_models = [ConstantMean(data_window[s], GARCH(1,1)).fit(disp='off') for s in etf_symbols]
+            # Fit univariate GARCH(1,1) & collect std-residuals / variances
+            std_resids = []
+            cond_vars  = []
+            for s in etf_symbols:
+                am = ConstantMean(data_window[s])
+                am.volatility = GARCH(1, 1)
+                res = am.fit(disp="off")
+                std_resids.append(res.std_resid)
+                cond_vars.append(res.conditional_volatility ** 2)
             
-            # Fit the DCC model on the standardized residuals of the GARCH models
-            dcc_model = DCC(garch_models)
-            dcc_res = dcc_model.fit(disp='off')
-            
+            std_resids = np.column_stack(std_resids)           # shape (T, N)
+            cond_vars  = np.column_stack(cond_vars)            # shape (T, N)
+
             # Forecast 1-week-ahead covariance and annualize it
-            forecasted_cov = dcc_res.forecast(horizon=1).cov.iloc[-1].values * 52
+            forecasted_cov = forecast_dcc_cov(std_resids, cond_vars, horizon=1) * 52
             forecasted_mu = data_window.mean().values * 52
             
             # Find the optimal portfolio using the forecasted parameters
@@ -1278,6 +1408,7 @@ strategies = {
     'Black-Litterman': (returns_final[etf_symbols] @ w_bl_opt) if w_bl_opt is not None else pd.Series(dtype=float),
     'Risk Parity': (returns_final[etf_symbols] @ rp_weights) if rp_weights is not None else pd.Series(dtype=float),
     'Hierarchical Risk Parity': (returns_final[etf_symbols] @ hrp_weights) if hrp_weights is not None else pd.Series(dtype=float),
+    'HRP - MV blend VOO Expected Return': (returns_final[etf_symbols] @ w_tilt) if w_tilt is not None else pd.Series(dtype=float),
     'DCC-GARCH Dynamic': dynamic_returns_series_dcc,
     'Regime-Aware Dynamic': dynamic_returns_series
 }
@@ -1376,7 +1507,8 @@ simulation_portfolios = {
     'Static Resampled': w_resampled,
     'Black-Litterman': w_bl_opt,
     'Risk Parity': rp_weights,
-    'Hierarchical Risk Parity': hrp_weights
+    'Hierarchical Risk Parity': hrp_weights,
+    'HRP - MV blend VOO Expected Return': w_tilt
 }
 
 # Run simulation for each portfolio
