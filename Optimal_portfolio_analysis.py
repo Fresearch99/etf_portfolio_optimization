@@ -285,7 +285,7 @@ all_prices = pd.concat([df for df in all_prices_list if not df.empty], axis=1)
 all_prices.index = pd.to_datetime(all_prices.index).tz_localize(None)
 
 # Resample daily prices to month-end, then calculate monthly percentage returns
-returns_monthly = all_prices.resample("M").last().pct_change()
+returns_monthly = all_prices.resample("ME").last().pct_change()
 
 # Limit data to the last N years for a more relevant analysis window
 cutoff_date = returns_monthly.index.max() - pd.DateOffset(years=ANALYSIS_YEARS)
@@ -425,7 +425,7 @@ def efficient_frontier(
                 [np.ones(n_assets), np.zeros(n_assets)],
             ]
         )
-    ).T
+    )
 
     # --- END OF L1 REFORMULATION SETUP ---
 
@@ -1136,7 +1136,7 @@ try:
         print("  -> ARCH effects detected" if lm_test[1] < 0.05 else "  -> No significant ARCH effects")
 
     # Step 2: Perform rolling DCC optimization
-    month_ends = returns_weekly.resample("M").last().index
+    month_ends = returns_weekly.resample("ME").last().index
     voo_sigma_annual_weekly = returns_weekly["VOO"].std() * np.sqrt(52)
     rolling_dcc_weights_list = []
 
@@ -1223,7 +1223,7 @@ exog_df = get_fred_data(returns_monthly.index.min(), returns_monthly.index.max()
 
 # --- 5b. Align and Prepare Data for Modeling ---
 # Align all data to our monthly return frequency
-exog_monthly = exog_df.resample("M").last().ffill()
+exog_monthly = exog_df.resample("ME").last().ffill()
 common_index = returns_monthly.index.intersection(exog_monthly.index)
 returns_aligned = returns_monthly.loc[common_index]
 exog_aligned = exog_monthly.loc[common_index]
