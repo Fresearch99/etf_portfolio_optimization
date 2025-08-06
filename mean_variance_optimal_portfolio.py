@@ -21,8 +21,8 @@ import cvxopt as opt
 import warnings
 from arch.univariate.base import DataScaleWarning, ConvergenceWarning 
 import plotly.graph_objects as go
-from ipywidgets import FloatSlider, VBox, HTML, Button, Dropdown, HBox
-from IPython.display import display
+import dash
+from dash import dcc, html, Input, Output, State, ctx
 
 
 # --- Global Settings & Constants ---
@@ -65,154 +65,40 @@ warnings.filterwarnings("ignore", category=DataScaleWarning)       # ARCH data-s
 warnings.filterwarnings("ignore", category=RuntimeWarning)         # ARCH convergence
 
 
-
-etf_name_map = {'VBIL': '0-3 Month Treasury Bill ETF',
- 'VTEC': 'California Tax-Exempt Bond ETF',
- 'VOX': 'Communication Services ETF',
- 'VCR': 'Consumer Discretionary ETF',
- 'VDC': 'Consumer Staples ETF',
- 'VCRB': 'Core Bond ETF',
- 'VCRM': 'Core Tax-Exempt Bond ETF',
- 'VPLS': 'Core-Plus Bond ETF',
- 'VIG': 'Dividend Appreciation ETF',
- 'VWOB': 'Emerging Markets Government Bond ETF',
- 'VDE': 'Energy ETF',
- 'VSGX': 'ESG International Stock ETF',
- 'VCEB': 'ESG U.S. Corporate Bond ETF',
- 'ESGV': 'ESG U.S. Stock ETF',
- 'EDV': 'Extended Duration Treasury ETF',
- 'VXF': 'Extended Market ETF',
- 'VFH': 'Financials ETF',
- 'VEU': 'FTSE All-World ex-US ETF',
- 'VSS': 'FTSE All-World ex-US Small-Cap ETF',
- 'VEA': 'FTSE Developed Markets ETF',
- 'VWO': 'FTSE Emerging Markets ETF',
- 'VGK': 'FTSE Europe ETF',
- 'VPL': 'FTSE Pacific ETF',
- 'VNQI': 'Global ex-U.S. Real Estate ETF',
- 'VGVT': 'Government Securities Active ETF',
- 'VUG': 'Growth ETF',
- 'VHT': 'Health Care ETF',
- 'VYM': 'High Dividend Yield ETF',
- 'VIS': 'Industrials ETF',
- 'VGT': 'Information Technology ETF',
- 'BIV': 'Intermediate-Term Bond ETF',
- 'VCIT': 'Intermediate-Term Corporate Bond ETF',
- 'VTEI': 'Intermediate-Term Tax-Exempt Bond ETF',
- 'VGIT': 'Intermediate-Term Treasury ETF',
- 'VIGI': 'International Dividend Appreciation ETF',
- 'VYMI': 'International High Dividend Yield ETF',
- 'VV': 'Large-Cap ETF',
- 'BLV': 'Long-Term Bond ETF',
- 'VCLT': 'Long-Term Corporate Bond ETF',
- 'VTEL': 'Long-Term Tax-Exempt Bond ETF',
- 'VGLT': 'Long-Term Treasury ETF',
- 'VAW': 'Materials ETF',
- 'MGC': 'Mega Cap ETF',
- 'MGK': 'Mega Cap Growth ETF',
- 'MGV': 'Mega Cap Value ETF',
- 'VO': 'Mid-Cap ETF',
- 'VOT': 'Mid-Cap Growth ETF',
- 'VOE': 'Mid-Cap Value ETF',
- 'VMBS': 'Mortgage-Backed Securities ETF',
- 'VGMS': 'Multi-Sector Income Bond ETF',
- 'MUNY': 'New York Tax-Exempt Bond ETF',
- 'VNQ': 'Real Estate ETF',
- 'VONE': 'Russell 1000 ETF',
- 'VONG': 'Russell 1000 Growth ETF',
- 'VONV': 'Russell 1000 Value ETF',
- 'VTWO': 'Russell 2000 ETF',
- 'VTWG': 'Russell 2000 Growth ETF',
- 'VTWV': 'Russell 2000 Value ETF',
- 'VTHR': 'Russell 3000 ETF',
- 'VOO': 'S&P 500 ETF',
- 'VOOG': 'S&P 500 Growth ETF',
- 'VOOV': 'S&P 500 Value ETF',
- 'IVOO': 'S&P Mid-Cap 400 ETF',
- 'IVOG': 'S&P Mid-Cap 400 Growth ETF',
- 'IVOV': 'S&P Mid-Cap 400 Value ETF',
- 'VIOO': 'S&P Small-Cap 600 ETF',
- 'VIOG': 'S&P Small-Cap 600 Growth ETF',
- 'VIOV': 'S&P Small-Cap 600 Value ETF',
- 'VSDB': 'Short Duration Bond ETF',
- 'VSDM': 'Short Duration Tax-Exempt Bond ETF',
- 'BSV': 'Short-Term Bond ETF',
- 'VCSH': 'Short-Term Corporate Bond ETF',
- 'VTIP': 'Short-Term Inflation-Protected Securities ETF',
- 'VTES': 'Short-Term Tax-Exempt Bond ETF',
- 'VGSH': 'Short-Term Treasury ETF',
- 'VB': 'Small-Cap ETF',
- 'VBK': 'Small-Cap Growth ETF',
- 'VBR': 'Small-Cap Value ETF',
- 'VTEB': 'Tax-Exempt Bond ETF',
- 'BND': 'Total Bond Market ETF',
- 'VTC': 'Total Corporate Bond ETF',
- 'VTP': 'Total Inflation-Protected Securities ETF',
- 'BNDX': 'Total International Bond ETF',
- 'VXUS': 'Total International Stock ETF',
- 'VTI': 'Total Stock Market ETF',
- 'VTG': 'Total Treasury ETF',
- 'BNDW': 'Total World Bond ETF',
- 'VT': 'Total World Stock ETF',
- 'VFMV': 'U.S. Minimum Volatility ETF',
- 'VFMO': 'U.S. Momentum Factor ETF',
- 'VFMF': 'U.S. Multifactor ETF',
- 'VFQY': 'U.S. Quality Factor ETF',
- 'VFVA': 'U.S. Value Factor ETF',
- 'VUSB': 'Ultra-Short Bond ETF',
- 'VGUS': 'Ultra-Short Treasury ETF',
- 'VPU': 'Utilities ETF',
- 'VTV': 'Value ETF'}
-
+# Load immediately from local directory
+df_etf_metadata = pd.read_csv("data/df_etf_metadata.csv")
+etf_name_map = dict(zip(df_etf_metadata["Symbol"], df_etf_metadata["Fund name"]))
+etf_expense_map = dict(zip(df_etf_metadata["Symbol"], df_etf_metadata["Expense ratio"]))
 etf_symbols = list(etf_name_map.keys())
 
-def get_total_return_series(ticker):
-    """
-    Fetches maximum available historical prices for a ticker from Yahoo Finance,
-    adjusted for dividends and splits to represent total return.
-
-    Args:
-        ticker (str): The stock or ETF symbol.
-
-    Returns:
-        pd.DataFrame: A DataFrame of historical adjusted closing prices.
-                      Returns an empty DataFrame on failure.
-    """
-    print(f"Downloading data for {ticker}...")
-    try:
-        stock = yf.Ticker(ticker)
-        # 'back_adjust=True' provides a total return series by adjusting historical
-        # prices for both dividends and stock splits. 'auto_adjust=False' is required.
-        df = stock.history(period="max", auto_adjust=False, back_adjust=True)[
-            ["Close"]
-        ].rename(columns={"Close": ticker})
-        return df
-    except Exception as e:
-        print(f"Could not fetch data for {ticker}: {e}")
-        return pd.DataFrame()
+# To create a diversified portfolio of broad asset classes, we remove
+# specialized, sector-specific ETFs and redundant funds.
+industry_keywords = [
+    "Energy", "Health Care", "Consumer", "Materials", "Financials",
+    "Utilities", "Real Estate", "Industrials", "Communication", "Information Technology",
+]
+# List of specific ETFs to remove (often sector-focused or overlapping)
+remove_symbols = [
+    "VGT", "VHT", "VPU", "VDC", "VAW", "VIS", "VFH", "VNQ", "VOX", "VDE", "VCR",
+]
 
 
-# Combine all price series into one DataFrame
-all_prices_list = [get_total_return_series(ticker) for ticker in etf_symbols]
-all_prices = pd.concat([df for df in all_prices_list if not df.empty], axis=1)
+def is_industry_or_redundant(symbol, name_map):
+    """Checks if an ETF is sector-specific or on the removal list."""
+    name = name_map.get(symbol, "")
+    is_industry = any(keyword in name for keyword in industry_keywords)
+    is_redundant = symbol in remove_symbols
+    return is_industry or is_redundant
 
-# Standardize the index to datetime objects without timezone information
-all_prices.index = pd.to_datetime(all_prices.index).tz_localize(None)
 
-# Resample daily prices to month-end, then calculate monthly percentage returns
-returns_monthly = all_prices.resample("ME").last().pct_change()
+etf_symbols = [s for s in etf_symbols if not is_industry_or_redundant(s, etf_name_map)]
+etf_symbols = list(dict.fromkeys(etf_symbols))  # Ensure unique symbols
+print(f"\nFiltered down to {len(etf_symbols)} ETFs for analysis.")
 
-# Drop the last row if it's from the current (incomplete) month
-last_date = returns_monthly.index[-1]
-today = pd.Timestamp.today()
 
-# Check if last observation is in the current month and year
-if last_date.month == today.month and last_date.year == today.year:
-    returns_monthly = returns_monthly.iloc[:-1]
+# Load directly from local data
+returns_monthly = pd.read_csv("data/returns_monthly.csv", index_col=0, parse_dates=True)
 
-# Limit data to the last N years for a more relevant analysis window
-cutoff_date = returns_monthly.index.max() - pd.DateOffset(years=ANALYSIS_YEARS)
-returns_monthly = returns_monthly[returns_monthly.index > cutoff_date]
 
 
 # Data Cleaning:
@@ -232,6 +118,8 @@ if "VOO" not in etf_symbols:
         "VOO data is missing or was dropped. It is required for benchmark comparison."
     )
 
+# Create a NumPy array of expense ratios in the same order as our final ETF symbols
+expense_vector = np.array([etf_expense_map.get(sym, 0.0) for sym in etf_symbols])
 
 print(
     f"\nFinal analysis will use {len(etf_symbols)} ETFs over {len(returns_monthly)} months."
@@ -240,17 +128,16 @@ print(
     f"Analysis period: {returns_monthly.index.min().date()} to {returns_monthly.index.max().date()}"
 )
 
-# Calculate historical annualized mean returns
-annual_mu_sample = (returns_monthly.mean().values * 12)
+
+# Calculate historical annualized mean returns, net of expense ratios
+annual_mu_sample = (returns_monthly.mean().values * 12) - expense_vector
 
 # The sample covariance matrix is calculated from historical returns and annualized
 sample_cov = returns_monthly.cov().values
 annual_cov_sample = sample_cov * 12
 
-ovariance_matrix = returns_monthly.cov() * 12
-
 voo_returns_monthly = returns_monthly["VOO"]
-voo_mu_annual = voo_returns_monthly.mean() * 12
+voo_mu_annual = voo_returns_monthly.mean() * 12 - etf_expense_map.get("VOO", 0.0)
 voo_sigma_annual = voo_returns_monthly.std() * np.sqrt(12)
 
 
@@ -271,6 +158,7 @@ def select_portfolio(frontier, target_metric, target_value):
     diffs = np.abs(np.array(frontier[target_metric]) - target_value)
     idx = diffs.argmin()
     return idx, frontier["weights"][idx]
+
 
 
 def efficient_frontier(
@@ -412,11 +300,11 @@ def prune_frontier(frontier):
         "weights": [wlist[i] for i in keep_idx],
     }
 
-
 # Frontier using simple sample estimates
 ef_raw = prune_frontier(
     efficient_frontier(annual_cov_sample, annual_mu_sample, n_points=FRONTIER_POINTS)
 )
+
 
 # Find portfolios on each frontier matching the VOO benchmark's risk or return
 _, w_mu_raw = select_portfolio(ef_raw, "mu", voo_mu_annual)
@@ -432,126 +320,203 @@ weights = np.asarray(ef_raw["weights"])
 symbols = globals().get("symbols", etf_symbols)
 name_map = globals().get("name_map", etf_name_map)
 
-# --- Build the figure ---
+# ── 0.  CONSTANTS ─── #
+RESOLUTION = 0.0001         # one-basis-point step (≈0.01 %) for smooth sliders
 
-fig = go.FigureWidget()
-fig.layout.hovermode = "closest"
-fig.layout.clickmode = "event+select"
-fig.layout.plot_bgcolor = "white"
-fig.layout.paper_bgcolor = "white"
 
-fig.add_scatter(x=sigmas, y=mus, mode="lines", line=dict(color="lightgray"),
-                hoverinfo="skip", showlegend=False)
+# ──- 1.  BUILD STATIC PART OF THE FIGURE ─--- #
 
-frontier_pts = go.Scatter(
-    x=sigmas, y=mus, mode="markers",
-    marker=dict(size=7, color="gray", opacity=0.5),
-    name="Raw Frontier",
-    hoverlabel=dict(bgcolor="white"),
-    hovertemplate="σ: %{x:.2%}<br>µ: %{y:.2%}<br>(click to see top weights)<extra></extra>"
-)
-fig.add_trace(frontier_pts)
-
-fig.add_scatter(x=[voo_sigma_annual], y=[voo_mu_annual], mode="markers",
-                marker=dict(symbol="diamond", size=14, color="royalblue", line=dict(width=2, color="black")),
-                name="VOO (ref)",
-                hoverlabel=dict(bgcolor="white"),
-                hovertemplate="VOO\nσ: %{x:.2%}<br>µ: %{y:.2%}<extra></extra>")
-
-mid = len(sigmas) // 2
-fig.add_scatter(x=[sigmas[mid]], y=[mus[mid]], mode="markers",
-                marker=dict(size=14, color="red", line=dict(width=2, color="black")),
-                name="Selected",
-                hoverinfo="skip")
-sel_idx = len(fig.data) - 1
-
-fig.update_layout(title="Efficient Frontier (Raw Estimates)",
-                  xaxis_title="Volatility (σ)", yaxis_title="Expected Return (µ)",
-                  height=480)
-
-# --- Top 3 Portfolio Components ---
-
-def format_html(idx: int) -> str:
-    w = weights[idx]
-    top_idx = np.argsort(w)[-3:][::-1]
-    rows = [
-        f"<li><b>{symbols[i]}</b> <span style='color:#666'>({name_map.get(symbols[i],'Unknown')})</span>"
-        f"<span style='float:right'>{w[i]:.2%}</span></li>"
-        for i in top_idx if w[i] > 0.001
-    ]
-    return (
-        "<div style='font-family:Arial, sans-serif; font-size:14px; line-height:1.4; max-width:420px;'>"
-        f"<h4 style='margin:4px 0 8px 0; font-size:15px;'>Top 3 ETFs – Frontier Point {idx+1}</h4>"
-        "<ul style='list-style:none; padding-left:0; margin:0;'>" + "\n".join(rows) + "</ul></div>"
+def build_initial_fig():
+    fig = go.Figure()
+    fig.update_layout(
+        title="Efficient Frontier (Raw Estimates)",
+        xaxis_title="Volatility (σ)",
+        yaxis_title="Expected Return (µ)",
+        hovermode="closest",
+        clickmode="event+select",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=480,
     )
 
-out = HTML()
+    # frontier line
+    fig.add_scatter(
+        x=sigmas,
+        y=mus,
+        mode="lines",
+        line=dict(color="lightgray"),
+        hoverinfo="skip",
+        showlegend=False,
+    )
 
-# --- Sliders ---
+    # frontier points (trace 1)
+    fig.add_scatter(
+        x=sigmas,
+        y=mus,
+        mode="markers",
+        marker=dict(size=7, color="gray", opacity=0.5),
+        name="Raw Frontier",
+        hoverlabel=dict(bgcolor="white"),
+        hovertemplate="σ: %{x:.2%}<br>µ: %{y:.2%}<br>(click to see top weights)<extra></extra>",
+    )
 
-mu_slider = FloatSlider(value=mus[mid], min=mus.min(), max=mus.max(), step=0.0005,
-                        description="Target µ", readout_format=".2%", continuous_update=False,
-                        layout=dict(width="450px"))
+    # VOO reference (trace 2)
+    fig.add_scatter(
+        x=[voo_sigma_annual],
+        y=[voo_mu_annual],
+        mode="markers",
+        marker=dict(
+            symbol="diamond", size=14, color="royalblue", line=dict(width=2, color="black")
+        ),
+        name="VOO (ref)",
+        hoverlabel=dict(bgcolor="white"),
+        hovertemplate="VOO<br>σ: %{x:.2%}<br>µ: %{y:.2%}<extra></extra>",
+    )
 
-sigma_slider = FloatSlider(value=sigmas[mid], min=sigmas.min(), max=sigmas.max(), step=0.0005,
-                           description="Target σ", readout_format=".2%", continuous_update=False,
-                           layout=dict(width="450px"))
+    # selected point (trace 3 — updated dynamically)
+    mid = len(sigmas) // 2
+    fig.add_scatter(
+        x=[sigmas[mid]],
+        y=[mus[mid]],
+        mode="markers",
+        marker=dict(size=14, color="red", line=dict(width=2, color="black")),
+        name="Selected",
+        hoverinfo="skip",
+    )
 
-# --- Sync logic ---
+    return fig
 
-def move_to_index(idx: int):
-    with fig.batch_update():
-        fig.data[sel_idx].x = [sigmas[idx]]
-        fig.data[sel_idx].y = [mus[idx]]
-    mu_slider.value = mus[idx]
-    sigma_slider.value = sigmas[idx]
-    out.value = format_html(idx)
+# ──- 2.  SMALL UTILS ─-- #
 
-move_to_index(mid)
+def top3_component(idx: int):
+    w = weights[idx]
+    top_idx = np.argsort(w)[-3:][::-1]
+    items = [
+        html.Li(
+            [
+                html.B(symbols[i]),
+                html.Span(f" ({name_map.get(symbols[i],'Unknown')})",
+                          style={"color": "#666"}),
+                html.Span(f"{w[i]:.2%}", style={"float": "right"}),
+            ]
+        )
+        for i in top_idx if w[i] > 0.001
+    ]
+    return html.Div(
+        [
+            html.H4(f"Top 3 ETFs – Frontier Point {idx+1}",
+                    style={"margin": "4px 0 8px 0", "fontSize": "15px"}),
+            html.Ul(items, style={"listStyle": "none", "paddingLeft": "0", "margin": "0"}),
+        ],
+        style={"fontFamily": "Arial, sans-serif", "fontSize": "14px",
+               "lineHeight": "1.4", "maxWidth": "420px"},
+    )
 
-def on_mu_change(change):
-    if change["name"] == "value":
-        idx = int(np.argmin(np.abs(mus - change["new"])))
-        move_to_index(idx)
 
-def on_sigma_change(change):
-    if change["name"] == "value":
-        idx = int(np.argmin(np.abs(sigmas - change["new"])))
-        move_to_index(idx)
+def closest_point(target_mu, target_sigma):
+    """Return index of frontier point closest to (target_sigma,target_mu)."""
+    dist = (mus - target_mu) ** 2 + (sigmas - target_sigma) ** 2
+    return int(np.argmin(dist))
 
-mu_slider.observe(on_mu_change, names="value")
-sigma_slider.observe(on_sigma_change, names="value")
 
-fig.data[1].on_click(lambda trace, points, selector: move_to_index(points.point_inds[0]) if points.point_inds else None)
+# ── 3.  LAYOUT ── #
+app = dash.Dash(__name__)
+fig_initial = build_initial_fig()
+mid_idx = len(sigmas) // 2
 
-# --- Snap-to button for VOO mu and sigma ---
-
-snap_button = Button(description="Snap to VOO", button_style="info")
-snap_criterion = Dropdown(
-    options=[("Match µ (return)", "mu"), ("Match σ (volatility)", "sigma")],
-    value="mu",
-    layout=dict(width="180px")
+app.layout = html.Div(
+    [
+        dcc.Graph(id="frontier-graph", figure=fig_initial, style={"height": "500px"}),
+        html.Div(
+            [
+                html.Label("Target µ"),
+                dcc.Slider(
+                    id="mu-slider",
+                    min=float(mus.min()),
+                    max=float(mus.max()),
+                    value=float(round(mus[mid_idx], 2)),
+                    step=RESOLUTION,    # ← continuous & clickable
+                    marks=None,           # ← hide grey numbers
+                    updatemode="drag",
+                    tooltip={"placement": "bottom"},
+                ),
+            ],
+            style={"margin": "20px 0"},
+        ),
+        html.Div(
+            [
+                html.Label("Target σ"),
+                dcc.Slider(
+                    id="sigma-slider",
+                    min=float(sigmas.min()),
+                    max=float(sigmas.max()),
+                    value=float(round(sigmas[mid_idx], 2)),
+                    step=RESOLUTION,
+                    marks=None,
+                    updatemode="drag",
+                    tooltip={"placement": "bottom"},
+                ),
+            ],
+            style={"margin": "20px 0"},
+        ),
+        html.Div(
+            [
+                html.Button("Snap to VOO", id="snap-btn", n_clicks=0, className="btn"),
+                dcc.Dropdown(
+                    id="snap-criterion",
+                    options=[
+                        {"label": "Match µ (return)", "value": "mu"},
+                        {"label": "Match σ (volatility)", "value": "sigma"},
+                    ],
+                    value="mu",
+                    style={"width": "180px", "display": "inline-block", "marginLeft": "10px"},
+                ),
+            ],
+            style={"margin": "10px 0"},
+        ),
+        html.Div(id="top-weights-box"),
+    ],
+    style={"width": "700px", "margin": "auto"},
 )
 
-def on_snap(_):
-    if snap_criterion.value == "mu":
-        idx = int(np.argmin(np.abs(mus - voo_mu_annual)))
+# ── 4.  CALLBACKS ───────────────────────────────────────────────────────────── #
+@app.callback(
+    Output("frontier-graph", "figure"),
+    Output("mu-slider", "value"),
+    Output("sigma-slider", "value"),
+    Output("top-weights-box", "children"),
+    Input("frontier-graph", "clickData"),
+    Input("mu-slider", "value"),
+    Input("sigma-slider", "value"),
+    Input("snap-btn", "n_clicks"),
+    State("snap-criterion", "value"),
+    prevent_initial_call=True,
+)
+def update_dash(click_data, mu_val, sigma_val, n_clicks, snap_choice):
+    trigger = ctx.triggered_id
+    sel_idx = mid_idx
+
+    if trigger == "frontier-graph" and click_data:
+        sel_idx = click_data["points"][0]["pointIndex"]
+    elif trigger == "snap-btn" and n_clicks:
+        sel_idx = int(np.argmin(np.abs(mus - voo_mu_annual))) if snap_choice == "mu" \
+                  else int(np.argmin(np.abs(sigmas - voo_sigma_annual)))
     else:
-        idx = int(np.argmin(np.abs(sigmas - voo_sigma_annual)))
-    move_to_index(idx)
+        sel_idx = closest_point(mu_val, sigma_val)
 
-snap_button.on_click(on_snap)
+    # update selected marker
+    fig = build_initial_fig()
+    fig.data[3].x = [sigmas[sel_idx]]
+    fig.data[3].y = [mus[sel_idx]]
 
-# --- Display ------------------------------------------------------
+    # round slider feedback to two decimals
+    mu_val_new    = round(float(mus[sel_idx]), 2)
+    sigma_val_new = round(float(sigmas[sel_idx]), 2)
 
-display(VBox([
-    fig,
-    mu_slider,
-    sigma_slider,
-    HBox([snap_button, snap_criterion]),
-    out
-]))
+    html_output = top3_component(sel_idx)
 
+    return fig, mu_val_new, sigma_val_new, html_output
 
-
-
+# ── 5.  RUN ─────────────────────────────────────────────────────────────────── #
+if __name__ == "__main__":
+    app.run_server(debug=True, port=8050, use_reloader=False)
