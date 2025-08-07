@@ -1,0 +1,98 @@
+Symbol,Fund name,Expense ratio
+VBIL,0-3 Month Treasury Bill ETF,0.0007000000000000001
+VTEC,California Tax-Exempt Bond ETF,0.0008
+VOX,Communication Services ETF,0.0009
+VCR,Consumer Discretionary ETF,0.0009
+VDC,Consumer Staples ETF,0.0009
+VCRB,Core Bond ETF,0.001
+VCRM,Core Tax-Exempt Bond ETF,0.0012
+VPLS,Core-Plus Bond ETF,0.002
+VIG,Dividend Appreciation ETF,0.0005
+VWOB,Emerging Markets Government Bond ETF,0.0015
+VDE,Energy ETF,0.0009
+VSGX,ESG International Stock ETF,0.001
+VCEB,ESG U.S. Corporate Bond ETF,0.0012
+ESGV,ESG U.S. Stock ETF,0.0009
+EDV,Extended Duration Treasury ETF,0.0005
+VXF,Extended Market ETF,0.0005
+VFH,Financials ETF,0.0009
+VEU,FTSE All-World ex-US ETF,0.0004
+VSS,FTSE All-World ex-US Small-Cap ETF,0.0008
+VEA,FTSE Developed Markets ETF,0.0003
+VWO,FTSE Emerging Markets ETF,0.0007000000000000001
+VGK,FTSE Europe ETF,0.0006
+VPL,FTSE Pacific ETF,0.0007000000000000001
+VNQI,Global ex-U.S. Real Estate ETF,0.0012
+VGVT,Government Securities Active ETF,0.001
+VUG,Growth ETF,0.0004
+VHT,Health Care ETF,0.0009
+VYM,High Dividend Yield ETF,0.0006
+VIS,Industrials ETF,0.0009
+VGT,Information Technology ETF,0.0009
+BIV,Intermediate-Term Bond ETF,0.0003
+VCIT,Intermediate-Term Corporate Bond ETF,0.0003
+VTEI,Intermediate-Term Tax-Exempt Bond ETF,0.0008
+VGIT,Intermediate-Term Treasury ETF,0.0003
+VIGI,International Dividend Appreciation ETF,0.001
+VYMI,International High Dividend Yield ETF,0.0017000000000000001
+VV,Large-Cap ETF,0.0004
+BLV,Long-Term Bond ETF,0.0003
+VCLT,Long-Term Corporate Bond ETF,0.0003
+VTEL,Long-Term Tax-Exempt Bond ETF,0.0009
+VGLT,Long-Term Treasury ETF,0.0003
+VAW,Materials ETF,0.0009
+MGC,Mega Cap ETF,0.0007000000000000001
+MGK,Mega Cap Growth ETF,0.0007000000000000001
+MGV,Mega Cap Value ETF,0.0007000000000000001
+VO,Mid-Cap ETF,0.0004
+VOT,Mid-Cap Growth ETF,0.0007000000000000001
+VOE,Mid-Cap Value ETF,0.0007000000000000001
+VMBS,Mortgage-Backed Securities ETF,0.0003
+VGMS,Multi-Sector Income Bond ETF,0.003
+MUNY,New York Tax-Exempt Bond ETF,0.0009
+VNQ,Real Estate ETF,0.0013
+VONE,Russell 1000 ETF,0.0007000000000000001
+VONG,Russell 1000 Growth ETF,0.0007000000000000001
+VONV,Russell 1000 Value ETF,0.0007000000000000001
+VTWO,Russell 2000 ETF,0.0007000000000000001
+VTWG,Russell 2000 Growth ETF,0.001
+VTWV,Russell 2000 Value ETF,0.001
+VTHR,Russell 3000 ETF,0.0007000000000000001
+VOO,S&P 500 ETF,0.0003
+VOOG,S&P 500 Growth ETF,0.0007000000000000001
+VOOV,S&P 500 Value ETF,0.0007000000000000001
+IVOO,S&P Mid-Cap 400 ETF,0.0007000000000000001
+IVOG,S&P Mid-Cap 400 Growth ETF,0.001
+IVOV,S&P Mid-Cap 400 Value ETF,0.001
+VIOO,S&P Small-Cap 600 ETF,0.0007000000000000001
+VIOG,S&P Small-Cap 600 Growth ETF,0.001
+VIOV,S&P Small-Cap 600 Value ETF,0.001
+VSDB,Short Duration Bond ETF,0.0015
+VSDM,Short Duration Tax-Exempt Bond ETF,0.0012
+BSV,Short-Term Bond ETF,0.0003
+VCSH,Short-Term Corporate Bond ETF,0.0003
+VTIP,Short-Term Inflation-Protected Securities ETF,0.0003
+VTES,Short-Term Tax-Exempt Bond ETF,0.0006
+VGSH,Short-Term Treasury ETF,0.0003
+VB,Small-Cap ETF,0.0005
+VBK,Small-Cap Growth ETF,0.0007000000000000001
+VBR,Small-Cap Value ETF,0.0007000000000000001
+VTEB,Tax-Exempt Bond ETF,0.0003
+BND,Total Bond Market ETF,0.0003
+VTC,Total Corporate Bond ETF,0.0003
+VTP,Total Inflation-Protected Securities ETF,0.0005
+BNDX,Total International Bond ETF,0.0007000000000000001
+VXUS,Total International Stock ETF,0.0005
+VTI,Total Stock Market ETF,0.0003
+VTG,Total Treasury ETF,0.0003
+BNDW,Total World Bond ETF,0.0005
+VT,Total World Stock ETF,0.0006
+VFMV,U.S. Minimum Volatility ETF,0.0013
+VFMO,U.S. Momentum Factor ETF,0.0013
+VFMF,U.S. Multifactor ETF,0.0018
+VFQY,U.S. Quality Factor ETF,0.0013
+VFVA,U.S. Value Factor ETF,0.0013
+VUSB,Ultra-Short Bond ETF,0.001
+VGUS,Ultra-Short Treasury ETF,0.0007000000000000001
+VPU,Utilities ETF,0.0009
+VTV,Value ETF,0.0004
