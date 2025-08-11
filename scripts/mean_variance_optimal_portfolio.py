@@ -15,21 +15,26 @@ import warnings
 # --- Third-Party Library Imports ---
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import cvxopt as opt
+import cvxpy as cp
 
-import warnings
-from arch.univariate.base import DataScaleWarning, ConvergenceWarning 
+from pathlib import Path
+from functools import lru_cache
+from collections import deque
+
 import plotly.graph_objects as go
+
+import webbrowser
+import threading
 import dash
 from dash import dcc, html, Input, Output, State, ctx
+from flask import request
+import threading, time, os
+
+_last_ping = time.time()
 
 
 # --- Global Settings & Constants ---
 # Set the working directory.
-# NOTE: You may need to change this path to your project's root directory.
-DIRECTORY = "."
-os.chdir(DIRECTORY)
 
 # Set the seed
 np.random.seed(42)
@@ -48,25 +53,76 @@ ROLLING_WINDOW_MONTHS = 60  # 5-year rolling window for dynamic weight analysis.
 MIN_OBS_PER_REGIME = 6  # Minimum data points required to consider a regime valid.
 MAX_REGIMES_TO_TEST = 4  # Test models with 2 up to this number of regimes.
 
-# --- Initial Setup ---
+
 # Configure pandas for better display
 pd.set_option("display.float_format", lambda x: f"{x:.3f}")
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", None)
 pd.set_option("display.max_colwidth", None)
 
-# Configure the CVXOPT solver to not display progress messages
-opt.solvers.options["show_progress"] = False
 
-# ─── Warning filters ───
-warnings.filterwarnings("ignore", category=UserWarning)            # generic statsmodels
-warnings.filterwarnings("ignore", category=ConvergenceWarning)     # sklearn / statsmodels
-warnings.filterwarnings("ignore", category=DataScaleWarning)       # ARCH data-scale
-warnings.filterwarnings("ignore", category=RuntimeWarning)         # ARCH convergence
+
+CANDIDATE_SCRIPT_DIRS = ("scripts", "script")
+REQUIRED_DATA_FILES = ("df_etf_metadata.csv", "returns_monthly.csv")
+
+def looks_like_root(p: Path) -> bool:
+    # Must have scripts/ (or script/) and data/
+    if not any((p / d).is_dir() for d in CANDIDATE_SCRIPT_DIRS):
+        return False
+    data = p / "data"
+    if not data.is_dir():
+        return False
+    # Require at least one expected file in data/ to avoid false positives
+    return any((data / f).exists() for f in REQUIRED_DATA_FILES)
+
+@lru_cache
+def find_project_root() -> Path:
+    start = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd().resolve()
+
+    # 1) Walk upward
+    for p in [start] + list(start.parents):
+        if looks_like_root(p):
+            return p
+        # 2) Check each ancestor's immediate children (handles being in Investment/)
+        for child in p.iterdir():
+            if child.is_dir() and looks_like_root(child):
+                return child
+
+    # 3) Bounded downward BFS from CWD (depth ≤ 3)
+    max_depth = 3
+    q = deque([(Path.cwd().resolve(), 0)])
+    visited = set()
+    while q:
+        node, depth = q.popleft()
+        if node in visited or depth > max_depth:
+            continue
+        visited.add(node)
+        if looks_like_root(node):
+            return node
+        if depth < max_depth:
+            for ch in node.iterdir():
+                if ch.is_dir():
+                    q.append((ch, depth + 1))
+
+    # 4) Optional env override (always wins)
+    env = os.getenv("ETF_OPTIMIZER_ROOT")
+    if env:
+        q = Path(env).resolve()
+        if looks_like_root(q):
+            return q
+
+    raise FileNotFoundError(f"Could not locate project root from start={start}")
+
+def data_path(name: str) -> Path:
+    return find_project_root() / "data" / name
+
+# Usage
+df_etf_metadata = pd.read_csv(data_path("df_etf_metadata.csv"))
+returns_monthly = pd.read_csv(data_path("returns_monthly.csv"), index_col=0, parse_dates=True)
 
 
 # Load immediately from local directory
-df_etf_metadata = pd.read_csv("data/df_etf_metadata.csv")
+df_etf_metadata = pd.read_csv(data_path("df_etf_metadata.csv"))
 etf_name_map = dict(zip(df_etf_metadata["Symbol"], df_etf_metadata["Fund name"]))
 etf_expense_map = dict(zip(df_etf_metadata["Symbol"], df_etf_metadata["Expense ratio"]))
 etf_symbols = list(etf_name_map.keys())
@@ -97,7 +153,7 @@ print(f"\nFiltered down to {len(etf_symbols)} ETFs for analysis.")
 
 
 # Load directly from local data
-returns_monthly = pd.read_csv("data/returns_monthly.csv", index_col=0, parse_dates=True)
+returns_monthly = pd.read_csv(data_path("returns_monthly.csv"), index_col=0, parse_dates=True)
 
 
 
@@ -161,107 +217,83 @@ def select_portfolio(frontier, target_metric, target_value):
 
 
 
-def efficient_frontier(
-    covariance_matrix, expected_returns, n_points=50, lambda_l1=0.0
-):
+def efficient_frontier(covariance_matrix, expected_returns, n_points=50, lambda_l1=0.0):
     """
     Calculates the efficient frontier using the Markowitz model with optional L1
-    regularization (LASSO). This encourages sparse portfolios by driving the
-    weights of less important assets to exactly zero.
-
-    This function reformulates the L1-regularized problem into a standard
-    Quadratic Program (QP) that can be solved efficiently by CVXOPT.
+    regularization (LASSO) via CVXPY. Long-only with 0 <= w <= 1 and sum(w)=1.
 
     Args:
-        covariance_matrix (np.array): Annualized covariance matrix of asset returns.
-        expected_returns (np.array): Annualized vector of expected asset returns.
-        n_points (int): The number of points to calculate along the frontier.
-        lambda_l1 (float): The regularization strength. Higher values lead to
-                           more sparsity (more zero weights).
+        covariance_matrix (np.array or pd.DataFrame): Annualized covariance matrix (n x n).
+        expected_returns (np.array or pd.Series): Annualized expected returns (n,).
+        n_points (int): Number of target-return points to trace along the frontier.
+        lambda_l1 (float): L1 regularization strength (higher => sparser weights).
 
     Returns:
-        dict: A dictionary containing returns ('mu'), volatilities ('sigma'),
-              and portfolio weights ('weights') for each point on the frontier.
+        dict with:
+          - 'mu': list of realized returns at each solution
+          - 'sigma': list of volatilities at each solution
+          - 'weights': list of np.array weights for each solution
     """
-    n_assets = len(expected_returns)
+    # --- inputs -> numpy
+    Sigma_in = np.asarray(covariance_matrix, dtype=float)
+    mu = np.asarray(expected_returns, dtype=float).ravel()
+    n = mu.shape[0]
 
-    # We solve for a combined vector x = [w, u] of size 2*n_assets, where:
-    # w: the standard portfolio weights (n_assets)
-    # u: auxiliary variables to handle the absolute value |w_i| (n_assets)
-    # The objective becomes: minimize 0.5*w'.Cov.w + lambda*1'.u
-    # Subject to: w-u <= 0, -w-u <= 0 (which implies u >= |w|)
+    # Symmetrize & tiny ridge for numerical stability (solver only)
+    Sigma = 0.5 * (Sigma_in + Sigma_in.T)
+    Sigma = Sigma + 1e-10 * np.eye(n)
 
-    # 1. The Quadratic Term P
-    # Only involves 'w', so P_new has the original covariance_matrix in the
-    # top-left block and zeros elsewhere.
-    P_l1 = opt.matrix(
-        np.block(
-            [
-                [covariance_matrix, np.zeros((n_assets, n_assets))],
-                [np.zeros((n_assets, n_assets)), np.zeros((n_assets, n_assets))],
-            ]
-        )
-    )
+    # targets to trace (you can choose a different grid if you prefer)
+    target_mus = np.linspace(mu.min(), mu.max(), n_points)
 
-    # 2. The Linear Term q
-    # The L1 penalty `lambda * sum(|w_i|)` is reformulated as `lambda * sum(u_i)`.
-    # This becomes the linear part of the objective, q'.x.
-    q_l1 = opt.matrix(np.concatenate([np.zeros(n_assets), lambda_l1 * np.ones(n_assets)]))
-
-    # 3. The Inequality Constraints G and h (for Gx <= h)
-    # These enforce u_i >= |w_i| and the original box constraints 0 <= w_i <= 1.
-    I = np.eye(n_assets)
-    Z = np.zeros((n_assets, n_assets))
-    G_l1 = opt.matrix(
-        np.block(
-            [
-                [I, -I],  # For w_i - u_i <= 0
-                [-I, -I],  # For -w_i - u_i <= 0
-                [-I, Z],  # For -w_i <= 0 (w_i >= 0)
-                [I, Z],  # For w_i <= 1
-            ]
-        )
-    )
-    h_l1 = opt.matrix(np.concatenate([np.zeros(3 * n_assets), np.ones(n_assets)]))
-
-    # 4. The Equality Constraints A and b (for Ax = b)
-    # These constraints (sum of weights = 1, portfolio return = target)
-    # only apply to the 'w' part of our variable vector 'x'.
-    A_l1 = opt.matrix(
-        np.block(
-            [
-                [expected_returns, np.zeros(n_assets)],
-                [np.ones(n_assets), np.zeros(n_assets)],
-            ]
-        )
-    )
-
-    # Iterate through a range of target returns to trace the frontier
-    target_mus = np.linspace(expected_returns.min(), expected_returns.max(), n_points)
     frontier = {"mu": [], "sigma": [], "weights": []}
-    for target_mu in target_mus:
-        # The RHS of the equality constraint
-        b_l1 = opt.matrix([target_mu, 1.0])
-        try:
-            # Solve the larger, reformulated QP problem
-            solution = opt.solvers.qp(P_l1, q_l1, G_l1, h_l1, A_l1, b_l1)
-            if solution["status"] == "optimal":
-                # Extract only the weights 'w' from the solution vector 'x'.
-                weights = np.array(solution["x"][:n_assets]).flatten()
-                # Clean up tiny weights due to solver precision
-                weights[np.abs(weights) < 1e-7] = 0
-                # Re-normalize to ensure sum is exactly 1 after cleanup
-                if np.sum(weights) > 0:
-                    weights /= np.sum(weights)
 
-                sigma = np.sqrt(weights.T @ covariance_matrix @ weights)
-                actual_mu = weights.T @ expected_returns
-                frontier["mu"].append(actual_mu)
-                frontier["sigma"].append(sigma)
-                frontier["weights"].append(weights)
-        except ValueError:
-            # Solver may fail if no feasible solution exists for a target return
-            pass
+    for target in target_mus:
+        w = cp.Variable(n)
+
+        # Base constraints: long-only, fully invested
+        cons_eq = [cp.sum(w) == 1, w >= 0, w <= 1, mu @ w == target]
+        cons_ge = [cp.sum(w) == 1, w >= 0, w <= 1, mu @ w >= target]
+
+        obj = cp.Minimize(cp.quad_form(w, Sigma) + lambda_l1 * cp.norm1(w))
+        prob = cp.Problem(obj, cons_eq)
+
+        # Try OSQP first (fast for QP), then SCS. If equality infeasible, relax to ≥.
+        solved = False
+        for constraints in (cons_eq, cons_ge):
+            prob = cp.Problem(obj, constraints)
+            try:
+                prob.solve(solver=cp.OSQP, verbose=False)
+                if w.value is None or prob.status not in ("optimal", "optimal_inaccurate"):
+                    raise RuntimeError
+                solved = True
+            except Exception:
+                try:
+                    prob.solve(solver=cp.SCS, verbose=False)
+                    solved = w.value is not None and prob.status in ("optimal", "optimal_inaccurate")
+                except Exception:
+                    solved = False
+            if solved:
+                break
+
+        if not solved or w.value is None:
+            # Skip this target if no feasible solution
+            continue
+
+        # Clean & renormalize
+        w_sol = np.asarray(w.value).ravel()
+        w_sol[np.abs(w_sol) < 1e-10] = 0.0
+        s = w_sol.sum()
+        w_sol = (w_sol / s) if s > 0 else np.ones(n) / n
+
+        # Report with original Sigma (no ridge) for sigma
+        sigma = float(np.sqrt(w_sol @ Sigma_in @ w_sol))
+        mu_realized = float(w_sol @ mu)
+
+        frontier["mu"].append(mu_realized)
+        frontier["sigma"].append(sigma)
+        frontier["weights"].append(w_sol)
+
     return frontier
 
 
@@ -424,6 +456,31 @@ app = dash.Dash(__name__)
 fig_initial = build_initial_fig()
 mid_idx = len(sigmas) // 2
 
+@app.server.route("/shutdown", methods=["POST"])
+def _shutdown():
+    # Try dev-server shutdown; else hard-exit
+    func = request.environ.get("werkzeug.server.shutdown")
+    if func:
+        func()
+    else:
+        os._exit(0)
+    return "Shutting down"
+
+@app.server.route("/ping", methods=["POST"])
+def _ping():
+    global _last_ping
+    _last_ping = time.time()
+    return "ok"
+
+def _watchdog(timeout=20):
+    global _last_ping
+    while True:
+        time.sleep(5)
+        if time.time() - _last_ping > timeout:
+            os._exit(0)
+
+threading.Thread(target=_watchdog, args=(20,), daemon=True).start()
+
 app.layout = html.Div(
     [
         dcc.Graph(id="frontier-graph", figure=fig_initial, style={"height": "500px"}),
@@ -475,6 +532,24 @@ app.layout = html.Div(
             style={"margin": "10px 0"},
         ),
         html.Div(id="top-weights-box"),
+        
+        html.Script("""
+            (function(){
+            const post = (u,b) => {
+                try {
+                if (navigator.sendBeacon) return navigator.sendBeacon(u, new Blob([b||'.'], {type:'text/plain'}));
+                fetch(u, {method:'POST', keepalive:true, body:b||'.'});
+                } catch(e){}
+            };
+            const base = window.location.origin;
+            // heartbeat every 5s
+            const t = setInterval(()=>post(base + '/ping'), 5000);
+            // try to shut down immediately when the tab/window goes away
+            const bye = () => { try{ post(base + '/shutdown','bye'); }catch(e){} };
+            window.addEventListener('pagehide', bye);
+            window.addEventListener('beforeunload', bye);
+            })();
+            """)
     ],
     style={"width": "700px", "margin": "auto"},
 )
@@ -517,6 +592,7 @@ def update_dash(click_data, mu_val, sigma_val, n_clicks, snap_choice):
 
     return fig, mu_val_new, sigma_val_new, html_output
 
-# ── 5.  RUN ─────────────────────────────────────────────────────────────────── #
+# ── 5.  RUN ─────────────────────────────────────────────────────────────────── #    
 if __name__ == "__main__":
-    app.run_server(debug=True, port=8050, use_reloader=False)
+    threading.Timer(1, lambda: webbrowser.open_new("http://127.0.0.1:8050/")).start()
+    app.run(debug=True, port=8050, use_reloader=False)
