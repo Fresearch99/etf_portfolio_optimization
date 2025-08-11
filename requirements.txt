@@ -1,9 +1,7 @@
-pandas>=2.2
 numpy>=1.26
-scipy>=1.11           # if you use scipy.optimize
-cvxpy>=1.4            # only if you solve with cvxpy (optional)
-matplotlib>=3.8       # if you save static plots
-plotly>=5.22          # if you export interactive HTML
-yfinance>=0.2         # only if you pull prices dynamically
-statsmodels>=0.14     # if you run regressions/Markov
-dash>=2.17            # only needed for the Dash app, not this script
+pandas>=2.2
+cvxpy>=1.4
+osqp>=0.6
+scs>=3.2
+plotly>=5.22
+dash>=3

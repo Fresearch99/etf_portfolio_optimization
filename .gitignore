@@ -1,0 +1,50 @@
+# --- Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+
+# --- Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+condaenv.*
+
+# --- Jupyter
+.ipynb_checkpoints/
+*.ipynb~
+
+# --- Logs & caches
+*.log
+logs/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS cruft
+.DS_Store
+._*
+Thumbs.db
+
+# --- IDEs
+.idea/
+.vscode/
+
+# --- Secrets / local config
+.env
+.env.*
+*.key
+*.pem
+
+# --- Browser drivers (if Selenium ever pulls them locally)
+chromedriver*
+geckodriver*
+msedgedriver*
+
+# --- Project-specific
+notebooks/Optimal_Portfolio_Analysis__test.ipynb

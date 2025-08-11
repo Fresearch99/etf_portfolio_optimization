@@ -1,0 +1,36 @@
+name: etf-optimizer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # Core
+  - numpy>=1.26
+  - pandas>=2.2
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - seaborn>=0.13
+  - statsmodels>=0.14
+  - scikit-learn>=1.4
+  # Optimization
+  - cvxpy>=1.4
+  - osqp>=0.6
+  - scs>=3.2
+  - clarabel>=0.11
+  # Data access
+  - yfinance>=0.2
+  - pandas-datareader>=0.10
+  - selenium>=4.17 
+  # Viz / App
+  - plotly>=5.22
+  - dash>=3
+  # Notebook
+  - jupyterlab
+  - anywidget
+  - ipykernel
+  - ipywidgets>=8
+  - jupyterlab_widgets>=3
+  - pip
+  - pip:
+      - arch>=6
+      - webdriver-manager>=4    # only if you use Selenium auto-driver
+      - cvxopt>=1.3           # add ONLY if you still import cvxopt; pip build can be finicky

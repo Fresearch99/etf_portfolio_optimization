@@ -1,89 +1,106 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Created on Mon Aug  4 22:32:03 2025
+Mean-Variance Optimization (MVO) — one-click Dash UI
 
-@author: dominikjurek
+This script:
+1) Locates the project root (robustly) and loads required CSVs from ./data
+2) Cleans/filters the ETF universe
+3) Computes a sample-based efficient frontier via CVXPY (long-only, 0–1 box)
+4) Builds a small Dash app to explore the frontier, snap to VOO, and display top weights
+5) Opens the browser automatically and runs the local server
 """
 
-
-
-# --- Standard Library Imports ---
+# ──────────────────────────────────────────────────────────────────────────────
+# Standard library imports
+# ──────────────────────────────────────────────────────────────────────────────
 import os
-import warnings
-
-# --- Third-Party Library Imports ---
-import numpy as np
-import pandas as pd
-import cvxpy as cp
-
+import time
+import threading
+import webbrowser
 from pathlib import Path
 from functools import lru_cache
 from collections import deque
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Third-party imports
+# ──────────────────────────────────────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import cvxpy as cp
 import plotly.graph_objects as go
-
-import webbrowser
-import threading
 import dash
 from dash import dcc, html, Input, Output, State, ctx
 from flask import request
-import threading, time, os
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Global state for the tab-close watchdog 
+# ──────────────────────────────────────────────────────────────────────────────
 _last_ping = time.time()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Global settings & constants 
+# ──────────────────────────────────────────────────────────────────────────────
 
-# --- Global Settings & Constants ---
-# Set the working directory.
-
-# Set the seed
+# For reproducible demos (does not affect optimization, only any random ops if added)
 np.random.seed(42)
 
-# Analysis Period
+# Analysis window (years) — not directly used by this file but preserved
 ANALYSIS_YEARS = 15
 
-# Optimization & Simulation Parameters
-FRONTIER_POINTS = 50  # Number of points to calculate on the efficient frontier.
-MC_SIM_SCENARIOS = 10000  # Number of scenarios for Monte Carlo simulation.
-MC_SIM_HORIZON_MONTHS = 120  # 10-year horizon for simulation.
-RESAMPLE_ITERATIONS = 100  # Number of bootstrap iterations for resampled frontier.
-ROLLING_WINDOW_MONTHS = 60  # 5-year rolling window for dynamic weight analysis.
+# Optimization & simulation parameters 
+FRONTIER_POINTS = 50          # Number of points along the efficient frontier
 
-# Regime Modeling Parameters
-MIN_OBS_PER_REGIME = 6  # Minimum data points required to consider a regime valid.
-MAX_REGIMES_TO_TEST = 4  # Test models with 2 up to this number of regimes.
-
-
-# Configure pandas for better display
+# Configure pandas display (unchanged)
 pd.set_option("display.float_format", lambda x: f"{x:.3f}")
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", None)
 pd.set_option("display.max_colwidth", None)
 
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Project root discovery and data path helpers 
+# ──────────────────────────────────────────────────────────────────────────────
 
 CANDIDATE_SCRIPT_DIRS = ("scripts", "script")
 REQUIRED_DATA_FILES = ("df_etf_metadata.csv", "returns_monthly.csv")
 
+
 def looks_like_root(p: Path) -> bool:
-    # Must have scripts/ (or script/) and data/
+    """
+    Heuristic: a project root must contain a 'data' folder and either
+    'scripts' or 'script'. We also require at least one expected CSV
+    inside 'data' to avoid false positives.
+    """
     if not any((p / d).is_dir() for d in CANDIDATE_SCRIPT_DIRS):
         return False
     data = p / "data"
     if not data.is_dir():
         return False
-    # Require at least one expected file in data/ to avoid false positives
     return any((data / f).exists() for f in REQUIRED_DATA_FILES)
+
 
 @lru_cache
 def find_project_root() -> Path:
+    """
+    Try to locate the project root by:
+      1) Walking upward from the script directory (or CWD if in a notebook)
+      2) Checking each ancestor's immediate children (handles being in a parent dir)
+      3) Bounded downward BFS from the CWD
+      4) Respecting an explicit override via ETF_OPTIMIZER_ROOT
+
+    Returns
+    -------
+    Path to the detected project root.
+
+    Raises
+    ------
+    FileNotFoundError if no plausible root is found.
+    """
     start = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd().resolve()
 
     # 1) Walk upward
     for p in [start] + list(start.parents):
         if looks_like_root(p):
             return p
-        # 2) Check each ancestor's immediate children (handles being in Investment/)
+        # 2) Check each ancestor's immediate children
         for child in p.iterdir():
             if child.is_dir() and looks_like_root(child):
                 return child
@@ -91,7 +108,7 @@ def find_project_root() -> Path:
     # 3) Bounded downward BFS from CWD (depth ≤ 3)
     max_depth = 3
     q = deque([(Path.cwd().resolve(), 0)])
-    visited = set()
+    visited: set[Path] = set()
     while q:
         node, depth = q.popleft()
         if node in visited or depth > max_depth:
@@ -104,146 +121,158 @@ def find_project_root() -> Path:
                 if ch.is_dir():
                     q.append((ch, depth + 1))
 
-    # 4) Optional env override (always wins)
+    # 4) Environment variable override (always wins if valid)
     env = os.getenv("ETF_OPTIMIZER_ROOT")
     if env:
-        q = Path(env).resolve()
-        if looks_like_root(q):
-            return q
+        cand = Path(env).resolve()
+        if looks_like_root(cand):
+            return cand
 
     raise FileNotFoundError(f"Could not locate project root from start={start}")
 
+
 def data_path(name: str) -> Path:
+    """Return absolute path to a file inside the ./data folder."""
     return find_project_root() / "data" / name
 
-# Usage
-df_etf_metadata = pd.read_csv(data_path("df_etf_metadata.csv"))
-returns_monthly = pd.read_csv(data_path("returns_monthly.csv"), index_col=0, parse_dates=True)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Data loading 
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Load immediately from local directory
+# Metadata (symbols, long names, expense ratios)
 df_etf_metadata = pd.read_csv(data_path("df_etf_metadata.csv"))
 etf_name_map = dict(zip(df_etf_metadata["Symbol"], df_etf_metadata["Fund name"]))
 etf_expense_map = dict(zip(df_etf_metadata["Symbol"], df_etf_metadata["Expense ratio"]))
 etf_symbols = list(etf_name_map.keys())
 
-# To create a diversified portfolio of broad asset classes, we remove
-# specialized, sector-specific ETFs and redundant funds.
+# Returns (monthly, wide format, date index)
+returns_monthly = pd.read_csv(data_path("returns_monthly.csv"), index_col=0, parse_dates=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Universe filtering: drop sector/overlapping ETFs to keep broad exposures
+## ──────────────────────────────────────────────────────────────────────────────
+
 industry_keywords = [
     "Energy", "Health Care", "Consumer", "Materials", "Financials",
     "Utilities", "Real Estate", "Industrials", "Communication", "Information Technology",
 ]
-# List of specific ETFs to remove (often sector-focused or overlapping)
-remove_symbols = [
-    "VGT", "VHT", "VPU", "VDC", "VAW", "VIS", "VFH", "VNQ", "VOX", "VDE", "VCR",
-]
+remove_symbols = ["VGT", "VHT", "VPU", "VDC", "VAW", "VIS", "VFH", "VNQ", "VOX", "VDE", "VCR"]
 
 
-def is_industry_or_redundant(symbol, name_map):
-    """Checks if an ETF is sector-specific or on the removal list."""
+def is_industry_or_redundant(symbol: str, name_map: dict[str, str]) -> bool:
+    """Return True if ETF looks sector-specific or is explicitly excluded."""
     name = name_map.get(symbol, "")
     is_industry = any(keyword in name for keyword in industry_keywords)
     is_redundant = symbol in remove_symbols
     return is_industry or is_redundant
 
 
+# Filter by sector/redundancy
 etf_symbols = [s for s in etf_symbols if not is_industry_or_redundant(s, etf_name_map)]
-etf_symbols = list(dict.fromkeys(etf_symbols))  # Ensure unique symbols
+# Ensure uniqueness (order-preserving)
+etf_symbols = list(dict.fromkeys(etf_symbols))
 print(f"\nFiltered down to {len(etf_symbols)} ETFs for analysis.")
 
-
-# Load directly from local data
+# Re-load returns (same file) — kept to respect original structure
 returns_monthly = pd.read_csv(data_path("returns_monthly.csv"), index_col=0, parse_dates=True)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Data cleaning: drop short histories and any remaining NA rows 
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-# Data Cleaning:
-# Drop ETFs that do not have at least 10 years of non-NA observations
-MIN_OBSERVATIONS = 10 * 12
+MIN_OBSERVATIONS = 10 * 12  # at least 10 years of monthly data
 returns_monthly = returns_monthly.dropna(axis=1, thresh=MIN_OBSERVATIONS)
-
-# Drop any month (row) that still has missing values
 returns_monthly = returns_monthly.dropna(axis=0)
 
-# Update final list of ETFs and related data based on the cleaned DataFrame
+# Final ETF list after cleaning
 etf_symbols = returns_monthly.columns.tolist()
 
-# The S&P 500 ETF (VOO) is our primary benchmark; it's required for the analysis.
+# Ensure VOO is present for benchmark comparison
 if "VOO" not in etf_symbols:
-    raise ValueError(
-        "VOO data is missing or was dropped. It is required for benchmark comparison."
-    )
+    raise ValueError("VOO data is missing or was dropped. Required for benchmark comparison.")
 
-# Create a NumPy array of expense ratios in the same order as our final ETF symbols
+# Expense ratios aligned to final symbol order
 expense_vector = np.array([etf_expense_map.get(sym, 0.0) for sym in etf_symbols])
 
-print(
-    f"\nFinal analysis will use {len(etf_symbols)} ETFs over {len(returns_monthly)} months."
-)
-print(
-    f"Analysis period: {returns_monthly.index.min().date()} to {returns_monthly.index.max().date()}"
-)
+print(f"\nFinal analysis will use {len(etf_symbols)} ETFs over {len(returns_monthly)} months.")
+print(f"Analysis period: {returns_monthly.index.min().date()} → {returns_monthly.index.max().date()}")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Summary stats used by MVO 
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Calculate historical annualized mean returns, net of expense ratios
+# Annualized mean returns (net of expense ratios)
 annual_mu_sample = (returns_monthly.mean().values * 12) - expense_vector
 
-# The sample covariance matrix is calculated from historical returns and annualized
+# Annualized covariance matrix
 sample_cov = returns_monthly.cov().values
 annual_cov_sample = sample_cov * 12
 
+# VOO benchmark stats (annualized)
 voo_returns_monthly = returns_monthly["VOO"]
 voo_mu_annual = voo_returns_monthly.mean() * 12 - etf_expense_map.get("VOO", 0.0)
 voo_sigma_annual = voo_returns_monthly.std() * np.sqrt(12)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper: pick portfolio closest to a target µ or σ 
+# ──────────────────────────────────────────────────────────────────────────────
 
-def select_portfolio(frontier, target_metric, target_value):
+def select_portfolio(frontier: dict, target_metric: str, target_value: float) -> tuple[int | None, np.ndarray | None]:
     """
-    Selects a portfolio from the efficient frontier closest to a target value.
+    Select the frontier portfolio closest to a target (by absolute distance).
 
-    Args:
-        frontier (dict): The efficient frontier dictionary.
-        target_metric (str): The metric to match ('mu' or 'sigma').
-        target_value (float): The target return or volatility.
+    Parameters
+    ----------
+    frontier : dict
+        Dict with lists 'mu', 'sigma', 'weights'.
+    target_metric : {'mu','sigma'}
+        Which series to match against.
+    target_value : float
+        Target expected return or volatility (annualized).
 
-    Returns:
-        tuple: Index and weights of the selected portfolio, or (None, None).
+    Returns
+    -------
+    (index, weights) or (None, None) if the frontier list is empty.
     """
     if not frontier[target_metric]:
         return None, None
     diffs = np.abs(np.array(frontier[target_metric]) - target_value)
-    idx = diffs.argmin()
+    idx = int(diffs.argmin())
     return idx, frontier["weights"][idx]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Efficient frontier via CVXPY 
+# ──────────────────────────────────────────────────────────────────────────────
 
-def efficient_frontier(covariance_matrix, expected_returns, n_points=50, lambda_l1=0.0):
+def efficient_frontier(
+    covariance_matrix, expected_returns, n_points: int = 50, lambda_l1: float = 0.0
+) -> dict:
     """
-    Calculates the efficient frontier using the Markowitz model with optional L1
-    regularization (LASSO) via CVXPY. Long-only with 0 <= w <= 1 and sum(w)=1.
+    Compute the (pruned) efficient frontier under long-only box constraints.
 
-    Args:
-        covariance_matrix (np.array or pd.DataFrame): Annualized covariance matrix (n x n).
-        expected_returns (np.array or pd.Series): Annualized expected returns (n,).
-        n_points (int): Number of target-return points to trace along the frontier.
-        lambda_l1 (float): L1 regularization strength (higher => sparser weights).
+    Objective:
+        minimize   w' Σ w + λ ||w||_1
+        subject to sum(w) = 1,   0 ≤ w ≤ 1,    μ'w == target   (or relaxed to ≥)
 
-    Returns:
-        dict with:
-          - 'mu': list of realized returns at each solution
-          - 'sigma': list of volatilities at each solution
-          - 'weights': list of np.array weights for each solution
+    Notes
+    -----
+    - Uses OSQP first (fast for QP); falls back to SCS if needed.
+    - If equality µ'w == target is infeasible, retries with µ'w ≥ target.
+    - Adds a tiny ridge to Σ during the solve for numerical stability,
+      but reports σ using the original (un-ridged) Σ.
     """
-    # --- inputs -> numpy
+    # Inputs → numpy
     Sigma_in = np.asarray(covariance_matrix, dtype=float)
     mu = np.asarray(expected_returns, dtype=float).ravel()
     n = mu.shape[0]
 
-    # Symmetrize & tiny ridge for numerical stability (solver only)
+    # Symmetrize + tiny ridge (solver only)
     Sigma = 0.5 * (Sigma_in + Sigma_in.T)
     Sigma = Sigma + 1e-10 * np.eye(n)
 
-    # targets to trace (you can choose a different grid if you prefer)
+    # Target return grid across the observed range
     target_mus = np.linspace(mu.min(), mu.max(), n_points)
 
     frontier = {"mu": [], "sigma": [], "weights": []}
@@ -256,9 +285,8 @@ def efficient_frontier(covariance_matrix, expected_returns, n_points=50, lambda_
         cons_ge = [cp.sum(w) == 1, w >= 0, w <= 1, mu @ w >= target]
 
         obj = cp.Minimize(cp.quad_form(w, Sigma) + lambda_l1 * cp.norm1(w))
-        prob = cp.Problem(obj, cons_eq)
 
-        # Try OSQP first (fast for QP), then SCS. If equality infeasible, relax to ≥.
+        # Try equality; if infeasible, relax to ≥
         solved = False
         for constraints in (cons_eq, cons_ge):
             prob = cp.Problem(obj, constraints)
@@ -277,16 +305,16 @@ def efficient_frontier(covariance_matrix, expected_returns, n_points=50, lambda_
                 break
 
         if not solved or w.value is None:
-            # Skip this target if no feasible solution
+            # Skip this target if still infeasible
             continue
 
-        # Clean & renormalize
+        # Clean & renormalize weights
         w_sol = np.asarray(w.value).ravel()
         w_sol[np.abs(w_sol) < 1e-10] = 0.0
         s = w_sol.sum()
         w_sol = (w_sol / s) if s > 0 else np.ones(n) / n
 
-        # Report with original Sigma (no ridge) for sigma
+        # Report σ with original Σ (without ridge)
         sigma = float(np.sqrt(w_sol @ Sigma_in @ w_sol))
         mu_realized = float(w_sol @ mu)
 
@@ -297,27 +325,25 @@ def efficient_frontier(covariance_matrix, expected_returns, n_points=50, lambda_
     return frontier
 
 
-def prune_frontier(frontier):
+# ──────────────────────────────────────────────────────────────────────────────
+# Frontier pruning: keep the efficient (upper) arm only 
+# ──────────────────────────────────────────────────────────────────────────────
+
+def prune_frontier(frontier: dict) -> dict:
     """
-    Removes dominated portfolios from a mean-variance frontier, keeping only
-    the efficient upper arm where return increases with volatility.
-
-    Args:
-        frontier (dict): A dict with keys 'sigma', 'mu', 'weights'.
-
-    Returns:
-        dict: A pruned frontier with the same structure.
+    Remove dominated points: sort by σ ascending and keep only
+    strictly increasing µ as σ increases.
     """
     vol = np.asarray(frontier["sigma"])
     ret = np.asarray(frontier["mu"])
     wlist = list(frontier["weights"])
 
-    # 1) Sort by volatility (ascending)
+    # 1) Sort by volatility
     order = np.argsort(vol)
     vol, ret = vol[order], ret[order]
     wlist = [wlist[i] for i in order]
 
-    # 2) Walk from left to right, keeping only points with strictly increasing returns
+    # 2) Keep strictly increasing returns
     keep_idx = []
     last_best_ret = -np.inf
     for i in range(len(ret)):
@@ -325,40 +351,40 @@ def prune_frontier(frontier):
             keep_idx.append(i)
             last_best_ret = ret[i]
 
-    # 3) Assemble the pruned frontier
     return {
         "sigma": vol[keep_idx].tolist(),
         "mu": ret[keep_idx].tolist(),
         "weights": [wlist[i] for i in keep_idx],
     }
 
-# Frontier using simple sample estimates
+
+# Compute/prune the sample frontier (unchanged)
 ef_raw = prune_frontier(
     efficient_frontier(annual_cov_sample, annual_mu_sample, n_points=FRONTIER_POINTS)
 )
 
-
-# Find portfolios on each frontier matching the VOO benchmark's risk or return
+# Match VOO’s µ or σ on the frontier (weights not directly used in UI, preserved)
 _, w_mu_raw = select_portfolio(ef_raw, "mu", voo_mu_annual)
 _, w_sigma_raw = select_portfolio(ef_raw, "sigma", voo_sigma_annual)
 
-
-# --- Frontier arrays – ensure they exist ---
-
+# Ensure arrays exist for plotting/interaction
 sigmas = np.asarray(ef_raw["sigma"])
 mus = np.asarray(ef_raw["mu"])
 weights = np.asarray(ef_raw["weights"])
 
+# Expose symbols/name_map (preserving original globals fallback)
 symbols = globals().get("symbols", etf_symbols)
 name_map = globals().get("name_map", etf_name_map)
 
-# ── 0.  CONSTANTS ─── #
-RESOLUTION = 0.0001         # one-basis-point step (≈0.01 %) for smooth sliders
+# Slider resolution in absolute units (0.0001 ≈ 1 bp)
+RESOLUTION = 0.0001
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Plotly figure — static parts 
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ──- 1.  BUILD STATIC PART OF THE FIGURE ─--- #
-
-def build_initial_fig():
+def build_initial_fig() -> go.Figure:
+    """Create the base figure: frontier line + points, VOO marker, selected marker."""
     fig = go.Figure()
     fig.update_layout(
         title="Efficient Frontier (Raw Estimates)",
@@ -371,7 +397,7 @@ def build_initial_fig():
         height=480,
     )
 
-    # frontier line
+    # Frontier (line)
     fig.add_scatter(
         x=sigmas,
         y=mus,
@@ -381,7 +407,7 @@ def build_initial_fig():
         showlegend=False,
     )
 
-    # frontier points (trace 1)
+    # Frontier points
     fig.add_scatter(
         x=sigmas,
         y=mus,
@@ -392,20 +418,18 @@ def build_initial_fig():
         hovertemplate="σ: %{x:.2%}<br>µ: %{y:.2%}<br>(click to see top weights)<extra></extra>",
     )
 
-    # VOO reference (trace 2)
+    # VOO reference
     fig.add_scatter(
         x=[voo_sigma_annual],
         y=[voo_mu_annual],
         mode="markers",
-        marker=dict(
-            symbol="diamond", size=14, color="royalblue", line=dict(width=2, color="black")
-        ),
+        marker=dict(symbol="diamond", size=14, color="royalblue", line=dict(width=2, color="black")),
         name="VOO (ref)",
         hoverlabel=dict(bgcolor="white"),
         hovertemplate="VOO<br>σ: %{x:.2%}<br>µ: %{y:.2%}<extra></extra>",
     )
 
-    # selected point (trace 3 — updated dynamically)
+    # Selected point (initialized to mid)
     mid = len(sigmas) // 2
     fig.add_scatter(
         x=[sigmas[mid]],
@@ -415,75 +439,95 @@ def build_initial_fig():
         name="Selected",
         hoverinfo="skip",
     )
-
     return fig
 
-# ──- 2.  SMALL UTILS ─-- #
 
-def top3_component(idx: int):
+# ──────────────────────────────────────────────────────────────────────────────
+# Small UI helpers 
+# ──────────────────────────────────────────────────────────────────────────────
+
+def top3_component(idx: int) -> html.Div:
+    """Render a small list of the top-3 ETF weights for a frontier point."""
     w = weights[idx]
     top_idx = np.argsort(w)[-3:][::-1]
+
     items = [
         html.Li(
             [
                 html.B(symbols[i]),
-                html.Span(f" ({name_map.get(symbols[i],'Unknown')})",
-                          style={"color": "#666"}),
+                html.Span(f" ({name_map.get(symbols[i], 'Unknown')})", style={"color": "#666"}),
                 html.Span(f"{w[i]:.2%}", style={"float": "right"}),
             ]
         )
-        for i in top_idx if w[i] > 0.001
+        for i in top_idx
+        if w[i] > 0.001
     ]
+
     return html.Div(
         [
-            html.H4(f"Top 3 ETFs – Frontier Point {idx+1}",
-                    style={"margin": "4px 0 8px 0", "fontSize": "15px"}),
+            html.H4(
+                f"Top 3 ETFs – Frontier Point {idx + 1}",
+                style={"margin": "4px 0 8px 0", "fontSize": "15px"},
+            ),
             html.Ul(items, style={"listStyle": "none", "paddingLeft": "0", "margin": "0"}),
         ],
-        style={"fontFamily": "Arial, sans-serif", "fontSize": "14px",
-               "lineHeight": "1.4", "maxWidth": "420px"},
+        style={"fontFamily": "Arial, sans-serif", "fontSize": "14px", "lineHeight": "1.4", "maxWidth": "420px"},
     )
 
 
-def closest_point(target_mu, target_sigma):
-    """Return index of frontier point closest to (target_sigma,target_mu)."""
+def closest_point(target_mu: float, target_sigma: float) -> int:
+    """Index of the frontier point nearest to (target_sigma, target_mu)."""
     dist = (mus - target_mu) ** 2 + (sigmas - target_sigma) ** 2
     return int(np.argmin(dist))
 
 
-# ── 3.  LAYOUT ── #
+# ──────────────────────────────────────────────────────────────────────────────
+# Dash app: routes, watchdog, layout 
+# ──────────────────────────────────────────────────────────────────────────────
+
 app = dash.Dash(__name__)
 fig_initial = build_initial_fig()
-mid_idx = len(sigmas) // 2
+mid_idx = len(sigmas) // 2  # initial selection
 
+# Shutdown endpoint so the app can stop via browser tab close
 @app.server.route("/shutdown", methods=["POST"])
 def _shutdown():
-    # Try dev-server shutdown; else hard-exit
     func = request.environ.get("werkzeug.server.shutdown")
     if func:
-        func()
+        func()       # dev server path
     else:
-        os._exit(0)
+        os._exit(0)  # fallback
     return "Shutting down"
 
+
+# Heartbeat endpoint (browser pings periodically)
 @app.server.route("/ping", methods=["POST"])
 def _ping():
     global _last_ping
     _last_ping = time.time()
     return "ok"
 
-def _watchdog(timeout=20):
+
+def _watchdog(timeout: int = 20) -> None:
+    """
+    Watchdog thread: if the browser stops pinging for `timeout` seconds,
+    exit the process. Helps auto-stop on tab close in edge cases.
+    """
     global _last_ping
     while True:
         time.sleep(5)
         if time.time() - _last_ping > timeout:
             os._exit(0)
 
+
+# Start watchdog thread (daemon)
 threading.Thread(target=_watchdog, args=(20,), daemon=True).start()
 
+# Layout with graph, two sliders, "Snap to VOO" button, and top-3 weights box
 app.layout = html.Div(
     [
         dcc.Graph(id="frontier-graph", figure=fig_initial, style={"height": "500px"}),
+
         html.Div(
             [
                 html.Label("Target µ"),
@@ -492,14 +536,15 @@ app.layout = html.Div(
                     min=float(mus.min()),
                     max=float(mus.max()),
                     value=float(round(mus[mid_idx], 2)),
-                    step=RESOLUTION,    # ← continuous & clickable
-                    marks=None,           # ← hide grey numbers
+                    step=RESOLUTION,
+                    marks=None,
                     updatemode="drag",
                     tooltip={"placement": "bottom"},
                 ),
             ],
             style={"margin": "20px 0"},
         ),
+
         html.Div(
             [
                 html.Label("Target σ"),
@@ -516,6 +561,7 @@ app.layout = html.Div(
             ],
             style={"margin": "20px 0"},
         ),
+
         html.Div(
             [
                 html.Button("Snap to VOO", id="snap-btn", n_clicks=0, className="btn"),
@@ -531,30 +577,37 @@ app.layout = html.Div(
             ],
             style={"margin": "10px 0"},
         ),
+
         html.Div(id="top-weights-box"),
-        
-        html.Script("""
+
+        # Inject small script: ping server every 5s; attempt shutdown on tab close
+        html.Script(
+            """
             (function(){
-            const post = (u,b) => {
+              const post = (u,b) => {
                 try {
-                if (navigator.sendBeacon) return navigator.sendBeacon(u, new Blob([b||'.'], {type:'text/plain'}));
-                fetch(u, {method:'POST', keepalive:true, body:b||'.'});
+                  if (navigator.sendBeacon) return navigator.sendBeacon(u, new Blob([b||'.'], {type:'text/plain'}));
+                  fetch(u, {method:'POST', keepalive:true, body:b||'.'});
                 } catch(e){}
-            };
-            const base = window.location.origin;
-            // heartbeat every 5s
-            const t = setInterval(()=>post(base + '/ping'), 5000);
-            // try to shut down immediately when the tab/window goes away
-            const bye = () => { try{ post(base + '/shutdown','bye'); }catch(e){} };
-            window.addEventListener('pagehide', bye);
-            window.addEventListener('beforeunload', bye);
+              };
+              const base = window.location.origin;
+              // Heartbeat every 5s
+              const t = setInterval(()=>post(base + '/ping'), 5000);
+              // Attempt to shut down immediately when the tab/window goes away
+              const bye = () => { try { post(base + '/shutdown','bye'); } catch(e){} };
+              window.addEventListener('pagehide', bye);
+              window.addEventListener('beforeunload', bye);
             })();
-            """)
+            """
+        ),
     ],
     style={"width": "700px", "margin": "auto"},
 )
 
-# ── 4.  CALLBACKS ───────────────────────────────────────────────────────────── #
+# ──────────────────────────────────────────────────────────────────────────────
+# Dash callbacks 
+# ──────────────────────────────────────────────────────────────────────────────
+
 @app.callback(
     Output("frontier-graph", "figure"),
     Output("mu-slider", "value"),
@@ -568,6 +621,12 @@ app.layout = html.Div(
     prevent_initial_call=True,
 )
 def update_dash(click_data, mu_val, sigma_val, n_clicks, snap_choice):
+    """
+    Update the selected point, sliders, and top-weights view based on:
+      - click on a frontier point,
+      - "Snap to VOO" press (by µ or σ),
+      - or nearest point to the (µ, σ) sliders.
+    """
     trigger = ctx.triggered_id
     sel_idx = mid_idx
 
@@ -579,20 +638,25 @@ def update_dash(click_data, mu_val, sigma_val, n_clicks, snap_choice):
     else:
         sel_idx = closest_point(mu_val, sigma_val)
 
-    # update selected marker
+    # Rebuild figure and move the "Selected" marker (trace index 3)
     fig = build_initial_fig()
     fig.data[3].x = [sigmas[sel_idx]]
     fig.data[3].y = [mus[sel_idx]]
 
-    # round slider feedback to two decimals
-    mu_val_new    = round(float(mus[sel_idx]), 2)
+    # Slider feedback rounded to two decimals
+    mu_val_new = round(float(mus[sel_idx]), 2)
     sigma_val_new = round(float(sigmas[sel_idx]), 2)
 
     html_output = top3_component(sel_idx)
-
     return fig, mu_val_new, sigma_val_new, html_output
 
-# ── 5.  RUN ─────────────────────────────────────────────────────────────────── #    
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entrypoint 
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Open the browser shortly after server starts
     threading.Timer(1, lambda: webbrowser.open_new("http://127.0.0.1:8050/")).start()
+
+    # Dash 3.x API (no reloader to avoid opening two tabs)
     app.run(debug=True, port=8050, use_reloader=False)
